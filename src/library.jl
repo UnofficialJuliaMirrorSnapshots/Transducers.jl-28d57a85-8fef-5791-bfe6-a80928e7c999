@@ -99,7 +99,7 @@ julia> collect(Replace(Dict('a' => 'A')), "abc")
  'c'
 
 julia> collect(Replace([:a, :b, :c]), 0:4)
-5-element Array{Union{Int64, Symbol},1}:
+5-element Array{Any,1}:
  0
   :a
   :b
@@ -107,7 +107,7 @@ julia> collect(Replace([:a, :b, :c]), 0:4)
  4
 
 julia> collect(Replace("abc"), 0:4)
-5-element Array{Union{Char, Int64},1}:
+5-element Array{Any,1}:
  0
   'a'
   'b'
@@ -243,11 +243,6 @@ julia> collect(NotA(Missing), [1, missing, 2])
 2-element Array{Int64,1}:
  1
  2
-
-julia> collect(Filter(!ismissing), [1, missing, 2])  # see the eltype below
-2-element Array{Union{Missing, Int64},1}:
- 1
- 2
 ```
 """
 struct NotA{T} <: AbstractFilter end
@@ -279,11 +274,6 @@ julia> using Transducers
 
 julia> collect(OfType(Int), [1, missing, 2])
 2-element Array{Int64,1}:
- 1
- 2
-
-julia> collect(Filter(!ismissing), [1, missing, 2])  # see the eltype below
-2-element Array{Union{Missing, Int64},1}:
  1
  2
 ```
@@ -390,7 +380,7 @@ next(rf::R_{Take}, result, input) =
             n -= 1
         end
         if n <= 0
-            iresult = reduced(iresult)
+            iresult = reduced(complete(inner(rf), iresult))
         end
         return n, iresult
     end
@@ -446,17 +436,14 @@ function complete(rf::R_{TakeLast}, result)
     (c, buffer), iresult = unwrap(rf, result)
     if c <= 0  # buffer is not full (or c is just wrapping)
         for i in 1:(c + length(buffer))
-            iresult = next(inner(rf), iresult, @inbounds buffer[i])
-            @return_if_reduced complete(inner(rf), iresult)
+            iresult = @next(inner(rf), iresult, @inbounds buffer[i])
         end
     else
         for i in c+1:length(buffer)
-            iresult = next(inner(rf), iresult, @inbounds buffer[i])
-            @return_if_reduced complete(inner(rf), iresult)
+            iresult = @next(inner(rf), iresult, @inbounds buffer[i])
         end
         for i in 1:c
-            iresult = next(inner(rf), iresult, @inbounds buffer[i])
-            @return_if_reduced complete(inner(rf), iresult)
+            iresult = @next(inner(rf), iresult, @inbounds buffer[i])
         end
     end
     return complete(inner(rf), iresult)
@@ -487,7 +474,11 @@ struct TakeWhile{P} <: AbstractFilter
 end
 
 next(rf::R_{TakeWhile}, result, input) =
-    xform(rf).pred(input) ? next(inner(rf), result, input) : reduced(result)
+    if xform(rf).pred(input)
+        next(inner(rf), result, input)
+    else
+        reduced(complete(inner(rf), result))
+    end
 
 # https://clojure.github.io/clojure/clojure.core-api.html#clojure.core/take-nth
 # https://clojuredocs.org/clojure.core/take-nth
@@ -825,8 +816,7 @@ function complete(rf::R_{Partition}, result)
         iinput = @view buf[i:i + xform(rf).size - 1] # unsafe_view? @inbounds?
         iinput = @view iinput[s + 1:end]
         iinput :: DenseSubVector
-        iresult = next(inner(rf), iresult, iinput)
-        @return_if_reduced complete(inner(rf), iresult)
+        iresult = @next(inner(rf), iresult, iinput)
     end
     return complete(inner(rf), iresult)
 end
@@ -888,8 +878,7 @@ end
 function complete(rf::R_{PartitionBy}, ps)
     (iinput, _), iresult = unwrap(rf, ps)
     if !isempty(iinput)
-        iresult = next(inner(rf), iresult, iinput)
-        @return_if_reduced complete(inner(rf), iresult)
+        iresult = @next(inner(rf), iresult, iinput)
     end
     return complete(inner(rf), iresult)
 end
@@ -1104,9 +1093,8 @@ struct Scan{F, T} <: Transducer
     init::T
 end
 
-Scan(f) = Scan(f, nothing)
+Scan(f) = Scan(f, DefaultIdentityInitializer(f))
 
-_lefttype(xf::Scan{<:Any, Nothing}, intype) = typeof(identityof(xf.f, intype))
 _lefttype(xf::Scan, intype) = inittypeof(xf.init, intype)
 
 # Maybe this is fine:
@@ -1126,11 +1114,7 @@ function _type_scan_fixedpoint(f, A, X, limit = 10)
 end
 
 function start(rf::R_{Scan}, result)
-    if xform(rf).init === nothing
-        init = identityof(xform(rf).f, InType(rf))
-    else
-        init = _initvalue(rf)
-    end
+    init = _initvalue(rf)
     return wrap(rf, init, start(inner(rf), result))
 end
 
@@ -1210,8 +1194,7 @@ end
 function complete(rf::R_{ScanEmit}, result)
     u, iresult = unwrap(rf, result)
     if xform(rf).onlast !== nothing
-        iresult = next(inner(rf), iresult, xform(rf).onlast(u))
-        @return_if_reduced complete(inner(rf), iresult)
+        iresult = @next(inner(rf), iresult, xform(rf).onlast(u))
     end
     return complete(inner(rf), iresult)
 end
@@ -1223,6 +1206,103 @@ function combine(rf::R_{ScanEmit}, a, b)
     yc, uc = xform(rf).f(ua, ub)
     irc = next(inner(rf), irc, yc)
     return wrap(rf, uc, irc)
+end
+
+"""
+    AdHocXF(f, init, [onlast])
+
+# Examples
+```jldoctest
+julia> using Transducers
+       using Transducers: AdHocXF, @next
+       using Setfield: @set!
+
+julia> flushlast(rf, result) = rf(@next(rf, result, result.state));
+
+julia> xf = AdHocXF(Initializer(_ -> nothing), flushlast) do rf, result, input
+           m = match(r"^name:(.*)", input)
+           if m === nothing
+               push!(result.state.lines, input)
+               return result
+           else
+               chunk = result.state
+               @set! result.state = (name=strip(m.captures[1]), lines=String[])
+               push!(result.state.lines, input)
+               if chunk === nothing
+                   return result
+               else
+                   return rf(result, chunk)
+               end
+           end
+       end;
+
+julia> collect(xf, split(\"\"\"
+       name: Map
+       type: onetoone
+       name: Cat
+       type: expansive
+       name: Filter
+       type: contractive
+       name: Cat |> Filter
+       type: chaotic
+       \"\"\", "\\n"; keepempty=false))
+4-element Array{Any,1}:
+ (name = "Map", lines = ["name: Map", "type: onetoone"])
+ (name = "Cat", lines = ["name: Cat", "type: expansive"])
+ (name = "Filter", lines = ["name: Filter", "type: contractive"])
+ (name = "Cat |> Filter", lines = ["name: Cat |> Filter", "type: chaotic"])
+```
+"""
+struct AdHocXF{F, T, L} <: Transducer
+    f::F
+    init::T
+    onlast::L
+end
+
+AdHocXF(f, init) = AdHocXF(f, init, nothing)
+
+struct ResultShim{S, R}
+    state::S
+    result::R
+end
+
+struct RFShim{F}
+    rf::F
+end
+
+_setresult(shim, result::Reduced) = Reduced(@set shim.result = unreduced(result))
+_setresult(shim, result) = @set shim.result = result
+
+(f::RFShim)(shim::ResultShim) =
+    _setresult(shim, complete(f.rf, shim.result))
+(f::RFShim)(shim::ResultShim, input) =
+    _setresult(shim, next(f.rf, shim.result, input))
+
+start(rf::R_{AdHocXF}, result) =
+    wrap(rf, _initvalue(rf), start(inner(rf), result))
+
+next(rf::R_{AdHocXF}, result, input) =
+    wrapping(rf, result) do state, iresult
+        shim = xform(rf).f(RFShim(inner(rf)), ResultShim(state, iresult), input)
+        if shim isa Reduced
+            return unreduced(shim).state, Reduced(unreduced(shim).result)
+        else
+            return shim.state, shim.result
+        end
+    end
+
+function complete(rf::R_{AdHocXF}, result)
+    state, iresult = unwrap(rf, result)
+    onlast = xform(rf).onlast
+    if onlast !== nothing
+        shim = onlast(RFShim(inner(rf)), ResultShim(state, iresult))
+        if shim isa Reduced
+            return Reduced(unreduced(shim).result)
+        else
+            return shim.result
+        end
+    end
+    return complete(inner(rf), iresult)
 end
 
 """
@@ -1738,7 +1818,7 @@ start(rf::R_{Inject}, result) =
     wrap(rf, iterate(xform(rf).iterator), start(inner(rf), result))
 next(rf::R_{Inject}, result, input) =
     wrapping(rf, result) do istate, iresult
-        istate === nothing && return istate, reduced(iresult)
+        istate === nothing && return istate, reduced(complete(inner(rf), iresult))
         y, s = istate
         iresult2 = next(inner(rf), iresult, (input, y))
         return iterate(xform(rf).iterator, s), iresult2

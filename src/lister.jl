@@ -25,11 +25,12 @@ _unexported_public_api = (
     # Interface for reducibles
     __foldl__,
     getproperty(@__MODULE__, Symbol("@return_if_reduced")),
+    getproperty(@__MODULE__, Symbol("@next")),
 )
 
 is_internal(t) = (parentmodule(t) === @__MODULE__) && t ∉ _unexported_public_api
 
-is_transducer_type(t) = t isa Type && t <: Transducer
+is_transducer_type(t) = t isa Type && t <: Transducer && t !== Transducer
 is_transducer_type(::typeof(Zip)) = true
 
 struct TransducerLister

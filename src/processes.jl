@@ -1,6 +1,96 @@
 # --- Transducible processes
 
-@inline reducingfunction(xf::Transducer, step, intype::Type; simd=false) =
+"""
+    reducingfunction(xf, step; simd)
+
+Apply transducer `xf` to the reducing function `step` to create a new
+reducing function.
+
+!!! compat "Transducers.jl 0.3"
+
+    New in version 0.3.
+
+!!! warning
+
+    Be careful using `reducingfunction` with stateful transducers like
+    [`Scan`](@ref) with mutable `init` (e.g., `Scan(push!, [])`).  See
+    more in Examples below.
+
+# Arguments
+- `xf::Transducer`: A transducer.
+- `step`: A callable which accepts 1 and 2 arguments.  If it only
+  accepts 2 arguments, wrap it with [`Completing`](@ref) to "add"
+  1-argument form (i.e., [`complete`](@ref) protocol).
+
+# Keyword Arguments
+- `simd`: `false`, `true`, or `:ivdep`. See [`maybe_usesimd`](@ref).
+
+# Examples
+```jldoctest
+julia> using Transducers
+
+julia> rf = reducingfunction(Map(x -> x + 1), *);
+
+julia> rf(10, 2) === 10 * (2 + 1)
+true
+```
+
+## Warning: Be careful when using `reducingfunction` with stateful transducers
+
+Stateful `Transducer`s themselves in Transducers.jl are not inherently
+broken with `reducingfunction`.  However, it can produce incorrect
+results when combined with mutable states:
+
+```jldoctest reducingfunction; setup = :(using Transducers)
+julia> scan_state = [];
+
+julia> rf_bad = reducingfunction(Scan(push!, scan_state) |> Cat(), string);
+
+julia> transduce(rf_bad, "", 1:3)
+"112123"
+```
+
+The first run works.  However, observe that the vector `scan_state` is
+not empty anymore:
+
+```jldoctest reducingfunction
+julia> scan_state
+3-element Array{Any,1}:
+ 1
+ 2
+ 3
+```
+
+Thus, the second run produces an incorrect result:
+
+```jldoctest reducingfunction
+julia> transduce(rf_bad, "", 1:3)
+"123112312123123"
+```
+
+One way to solve this issue is to use [`CopyInit`](@ref) or
+[`Initializer`](@ref).
+
+```jldoctest reducingfunction
+julia> scan_state = CopyInit([])
+CopyInit(Any[])
+
+julia> rf_good = reducingfunction(Scan(push!, scan_state) |> Cat(), string);
+
+julia> transduce(rf_good, "", 1:3)
+"112123"
+
+julia> scan_state
+CopyInit(Any[])
+
+julia> transduce(rf_good, "", 1:3)
+"112123"
+```
+"""
+@inline reducingfunction(xf::Transducer, step; kwargs...) =
+    _reducingfunction(xf, step, NOTYPE; kwargs...)
+
+@inline _reducingfunction(xf::Transducer, step, intype::Typeish; simd=false) =
     maybe_usesimd(Reduction(xf, step, intype), simd)
 
 """
@@ -16,8 +106,7 @@ For a simple iterable type `MyType`, a valid implementation is:
 ```julia
 function __foldl__(rf, val, itr::MyType)
     for x in itr
-        val = next(rf, val, x)
-        @return_if_reduced complete(rf, val)
+        val = @next(rf, val, x)
     end
     return complete(rf, val)
 end
@@ -28,26 +117,30 @@ thus there is no need for defining it.  In general, defining
 `__foldl__` is useful only when there is a better way to go over items
 in `reducible` than `Base.iterate`.
 
-See also: [`@return_if_reduced`](@ref).
+See also: [`@next`](@ref).
 """
 __foldl__
+
+const FOLDL_RECURSION_LIMIT = Val(10)
+# const FOLDL_RECURSION_LIMIT = nothing
+_dec(::Nothing) = nothing
+_dec(::Val{n}) where n = Val(n - 1)
 
 function __foldl__(rf, init, coll)
     ret = iterate(coll)
     ret === nothing && return complete(rf, init)
-
-    # Some transducers like PartitionBy do a special type-unstable
-    # thing in the first iteration.  Let's try to make the main loop
-    # type-stable by hoisting it out.  It won't work when they are
-    # wrapped by filter-like Transducers but it may be a good
-    # optimization to cover a good amount of cases anyway.
     x, state = ret
-    val = next(rf, init, x)
-    @return_if_reduced complete(rf, val)
-    while (ret = iterate(coll, state)) !== nothing
+    val = @next(rf, init, x)
+    return _foldl_iter(rf, val, coll, state, FOLDL_RECURSION_LIMIT)
+end
+
+@inline function _foldl_iter(rf, val::T, iter, state, counter) where T
+    while (ret = iterate(iter, state)) !== nothing
         x, state = ret
-        val = next(rf, val, x)
-        @return_if_reduced complete(rf, val)
+        y = @next(rf, val, x)
+        counter === Val(0) || y isa T ||
+            return _foldl_iter(rf, y, iter, state, _dec(counter))
+        val = y
     end
     return complete(rf, val)
 end
@@ -56,12 +149,10 @@ end
 @inline function __foldl__(rf, init, arr::Union{AbstractArray, Broadcasted})
     isempty(arr) && return complete(rf, init)
     idxs = eachindex(arr)
-    val = next(rf, init, @inbounds arr[idxs[firstindex(idxs)]])
-    @return_if_reduced complete(rf, val)
+    val = @next(rf, init, @inbounds arr[idxs[firstindex(idxs)]])
     @simd_if rf for k in firstindex(idxs) + 1:lastindex(idxs)
         i = @inbounds idxs[k]
-        val = next(rf, val, @inbounds arr[i])
-        @return_if_reduced complete(rf, val)
+        val = @next(rf, val, @inbounds arr[i])
     end
     return complete(rf, val)
 end
@@ -76,11 +167,9 @@ end
             zs::Iterators.Zip{<:Tuple{Vararg{AbstractArray}}})
         isempty(zs) && return complete(rf, init)
         idxs = eachindex(zs.is...)
-        val = next(rf, init, _getvalues(firstindex(idxs), zs.is...))
-        @return_if_reduced complete(rf, val)
+        val = @next(rf, init, _getvalues(firstindex(idxs), zs.is...))
         @simd_if rf for i in firstindex(idxs) + 1:lastindex(idxs)
-            val = next(rf, val, _getvalues(i, zs.is...))
-            @return_if_reduced complete(rf, val)
+            val = @next(rf, val, _getvalues(i, zs.is...))
         end
         return complete(rf, val)
     end
@@ -111,17 +200,14 @@ end
     # TODO: Handle the case inner iterators are tuples.  In such case,
     # inner-most non-tuple iterators should use @simd_if.
     @simd_if rf for input in iterator
-        val_ = next(rf, val, (input, outer...))
-        @return_if_reduced complete(rf, val_)
-        val = val_
+        val = @next(rf, val, (input, outer...))
     end
     return val
 end
 
 function __simple_foldl__(rf, val, itr)
     for x in itr
-        val = next(rf, val, x)
-        @return_if_reduced complete(rf, val)
+        val = @next(rf, val, x)
     end
     return complete(rf, val)
 end
@@ -134,7 +220,7 @@ may be able to emit a good code.  This function exists only for
 performance tuning.
 """
 function simple_transduce(xform, f, init, coll)
-    rf = Reduction(xform, f, eltype(coll))
+    rf = rf_for(xform, f, init, eltype(coll))
     return __simple_foldl__(rf, _start_init(rf, init), coll)
 end
 
@@ -160,7 +246,7 @@ This API is modeled after $(_cljref("transduce")).
 
 # Arguments
 - `xf::Transducer`: A transducer.
-- `step`: A callable which accepts 1 or 2 arguments.  If it only
+- `step`: A callable which accepts 1 and 2 arguments.  If it only
   accepts 2 arguments, wrap it with [`Completing`](@ref) to "add"
   1-argument form (i.e., [`complete`](@ref) protocol).
 - `reducible`: A reducible object (array, dictionary, any iterator, etc.).
@@ -204,9 +290,17 @@ See [`mapfoldl`](@ref).
 transduce
 
 function transduce(xform::Transducer, f, init, coll; kwargs...)
-    rf = Reduction(xform, f, ieltype(coll))
+    rf = rf_for(xform, f, init, ieltype(coll))
     return transduce(rf, init, coll; kwargs...)
 end
+
+_needintype(xf, init) =
+    init isa MissingInit ||
+    (init isa Initializer && !(init isa CopyInit)) ||
+    needintype(xf)
+
+rf_for(xf, step, init, intype) =
+    Reduction(xf, step, _needintype(xf, init) ? intype : NOTYPE)
 
 struct MissingInit end
 
@@ -281,7 +375,7 @@ function Base.mapreduce(xform::Transducer, step, itr::AbstractArray;
                         init = MissingInit(),
                         simd = false,
                         kwargs...)
-    rf = reducingfunction(xform, step, eltype(itr); simd=simd)
+    rf = _reducingfunction(xform, step, eltype(itr); simd=simd)
     return unreduced(__reduce__(rf, init, itr; kwargs...))
 end
 
@@ -467,9 +561,19 @@ julia> collect(Interpose(missing), 1:3)
 ```
 """
 function Base.collect(xf::Transducer, coll)
-    rf = Reduction(xf, Completing(push!), eltype(coll))
-    to = FinalType(rf)[]
-    return unreduced(transduce(rf, to, coll))
+    if needintype(xf)
+        rf = Reduction(xf, Completing(push!), eltype(coll))
+        to = FinalType(rf)[]
+    else
+        rf = reducingfunction(xf, Completing(push!!))
+        to = Union{}[]
+    end
+    result = unreduced(transduce(rf, to, coll))
+    if result isa Vector{Union{}}
+        et = @default_finaltype(xf, coll)
+        return et[]
+    end
+    return result
 end
 # Base.collect(xf, coll) = append!([], xf, coll)
 
@@ -535,7 +639,7 @@ function _prepare_map(xf, dest, src, simd)
     # TODO: support Dict
     indices = eachindex(dest, src)
 
-    rf = reducingfunction(
+    rf = _reducingfunction(
         TeeZip(GetIndex{true}(src) |> xf) |> SetIndex{true}(dest),
         (::Vararg) -> nothing,
         eltype(indices);
@@ -631,14 +735,47 @@ end
 as the former does not have to translate the transducer protocol to
 the iterator protocol.
 
-Statements in native `for` loop can be translated as follows:
+`foreach` supports all constructs in the native `for` loop as well as
+the enhancements [^julia_issue_22891] to `break` with a value (`break
+D(x)` below) and append the `else` clause (`E(x)` below).
 
-| `for`      | `foreach`                          |
-|:---------- |:---------------------------------- |
-| `break`    | [`return reduced()`](@ref reduced) |
-| `continue` | `return`                           |
+[^julia_issue_22891]: See also: [break with value + loop else clauses
+    (JuliaLang/julia#22891)](https://github.com/JuliaLang/julia/issues/22891)
 
-See: [`mapfoldl`](@ref), [`reduced`](@ref), [`setinput`](@ref).
+This native `for` loop
+
+```julia
+ans = for x in xs
+    A(x)
+    B(x) && break
+    C(x) && break D(x)
+else
+    E(x)
+end
+```
+
+can be written as
+
+```julia
+ans = foreach(Map(identity), xs) do x
+    A(x)
+    B(x) && return reduced()
+    C(x) && return reduced(D(x))
+    x  # required for passing `x` to `E(x)` below
+end |> ifunreduced() do x
+    E(x)
+end
+```
+
+See: [`mapfoldl`](@ref), [`reduced`](@ref), [`ifunreduced`](@ref).
+
+!!! compat "Transducers.jl 0.3"
+
+    `foreach` is changed to return what the `do` block (`eff`
+    function) returns as-is in version 0.3.  This was required for
+    supporting "for-else" (`|> ifunreduced`).  Previously, it only
+    supported break-with-value and always applied `unreduced` before
+    it returns.
 
 # Examples
 ```jldoctest
@@ -649,6 +786,7 @@ julia> foreach(eduction(Filter(isodd), 1:4)) do input
        end
 input = 1
 input = 3
+3
 
 julia> foreach(Filter(!ismissing), [1, missing, 2, 3]) do input
            @show input
@@ -658,13 +796,105 @@ julia> foreach(Filter(!ismissing), [1, missing, 2, 3]) do input
        end
 input = 1
 input = 2
+Reduced(nothing)
+```
+
+It is often useful to append [`|> unreduced`](@ref unreduced) to
+unwrap `Reduced` in the final result (note that `|>` here is the
+standard function application, not the transducer composition).
+
+```jldoctest; setup = :(using Transducers)
+julia> foreach(Filter(!ismissing), [1, missing, 2, 3]) do input
+           reduced("got \$input")
+       end |> unreduced
+"got 1"
+```
+
+Combination of break-with-value and for-else is useful for triggering
+action after (e.g.) some kind of membership testing failed:
+
+```jldoctest; setup = :(using Transducers)
+julia> has2(xs) = foreach(Filter(!ismissing), xs) do input
+           input == 2 && reduced(true)
+       end |> ifunreduced() do input
+           @show input
+           false
+       end;
+
+julia> has2([1, missing, 2, 3])
+true
+
+julia> has2([1, missing])
+input = false
+false
+```
+
+However, note the output `input = false` in the last example.  This is
+because how `&&` works in Julia
+
+```jldoctest
+julia> false && "otherwise"
+false
+```
+
+Thus, pure membership testing functions like `has2` above can be
+written in a more concise manner:
+
+```jldoctest; setup = :(using Transducers)
+julia> simpler_has2(xs) = foreach(Filter(!ismissing), xs) do input
+           input == 2 && reduced(true)
+       end |> unreduced;
+
+julia> simpler_has2([1, missing, 2, 3])
+true
+
+julia> simpler_has2([1, missing])
+false
 ```
 """
 Base.foreach(eff, xform::Transducer, coll; kwargs...) =
-    unreduced(transduce(xform, SideEffect(eff), nothing, coll; kwargs...))
+    transduce(xform, SideEffect(eff), nothing, coll; kwargs...)
 Base.foreach(eff, ed::Eduction; kwargs...) =
-    unreduced(transduce(reform(ed.rf, SideEffect(eff)), nothing, ed.coll;
-                        kwargs...))
+    transduce(reform(ed.rf, SideEffect(eff)), nothing, ed.coll;
+              kwargs...)
+
+"""
+    ifunreduced(f, [x])
+
+Equivalent to [`unreduced(x)`](@ref unreduced) if `x` is a
+[`Reduced`](@ref); otherwise run `f(x)`.  Return a curried version if
+`x` is not provided.
+
+See: [`foreach`](@ref).
+
+# Examples
+```jldoctest
+julia> using Transducers
+
+julia> 1 |> ifunreduced() do x
+           println("called with x = ", x)
+       end
+called with x = 1
+
+julia> reduced(1) |> ifunreduced() do x
+           println("called with x = ", x)
+       end
+1
+```
+
+Notice that nothing is printed in the last example.
+
+# Implementation
+
+```julia
+ifunreduced(f) = x -> ifunreduced(f, x)
+ifunreduced(f, x::Reduced) = unreduced(x)
+ifunreduced(f, x) = f(x)
+```
+"""
+ifunreduced(f) = x -> ifunreduced(f, x)
+ifunreduced(f, x::Reduced) = unreduced(x)
+ifunreduced(f, x) = f(x)
 
 
 """
@@ -695,7 +925,7 @@ true
 
 julia> foreach(PartitionBy(isequal(1)), ch3) do input
            @show input
-       end
+       end;
 input = [1, 1]
 input = [2, 3, 4, 5]
 input = [1]
