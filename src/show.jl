@@ -9,12 +9,10 @@ function __foldl__(rf, val, xff::TransducerFolder)
     @nospecialize
     xf = _normalize(xff.xform)
     while xf isa Composition
-        val = next(rf, val, xf.outer)
-        @return_if_reduced val
+        val = @next(rf, val, xf.outer)
         xf = xf.inner
     end
-    val = next(rf, val, xf)
-    @return_if_reduced val
+    val = @next(rf, val, xf)
     return complete(rf, val)
 end
 
@@ -48,6 +46,10 @@ end
 
 is_anonymous(n) = n == :anonymous || startswith(string(n), '#')
 
+_is_default_arg(xf, name::Symbol, value) = is_default_arg(xf, Val(name), value)
+is_default_arg(xf, name, value) = false
+is_default_arg(xf::Scan, ::Val{:init}, value) = Scan(xf.f).init === value
+
 _name_of_transducer_type(xf) = nameof(typeof(xf))
 
 function show_transducer(io, mime, xf)
@@ -67,6 +69,7 @@ function show_args(io, mime, xf)
     isfirst = true
     for n in propertynames(xf)
         v = getproperty(xf, n)
+        _is_default_arg(xf, n, v) && continue
         if isfirst
             isfirst = false
             if multiline

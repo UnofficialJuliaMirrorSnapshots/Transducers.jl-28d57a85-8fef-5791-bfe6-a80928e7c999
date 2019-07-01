@@ -44,13 +44,17 @@ Transducers.Inject
 Reduced
 reduced
 unreduced
+ifunreduced
 ```
 
 ## Miscellaneous
 
 ```@docs
+Transducer(::Transducers.Comprehension)
+reducingfunction
 Completing
 Initializer
+CopyInit
 right
 setinput
 ```

@@ -4,7 +4,7 @@ using SparseArrays: issparse, sparse
 using Statistics: mean
 using Transducers
 using Transducers: Transducer, simple_transduce, Reduced, isexpansive,
-    TeeZip, GetIndex, SetIndex, Inject, @~
+    TeeZip, GetIndex, SetIndex, Inject, @~, outtype, infer_input_types
 
 inc(x) = x + oneunit(x)
 
@@ -19,7 +19,18 @@ function iterator_variants(xs)
     push!(iters, Base.Generator(identity, xs))
     if !issparse(xs) && !any(ismissing, xs)
         # Currently not optimal at all, but it should work.
-        push!(iters, sparse(xs))
+        if VERSION ≤ v"1.3-"
+            push!(iters, sparse(xs))
+        else
+            # If `SparseArrays` does not support it (e.g.,
+            # `sparse([""])` is not supported in Julia 1.3), don't
+            # bother.  However, don't stop testing it if it is
+            # re-supported again at some point.  So at least try:
+            try
+                push!(iters, sparse(xs))
+            catch
+            end
+        end
     end
     return iters
 end
@@ -56,6 +67,15 @@ macro test_broken_if(cond, ex)
     end
     esc(ex)
 end
+
+
+macro test_inferred(ex)
+    ex = quote
+        $Test.@test (($Test.@inferred $ex); true)
+    end
+    esc(ex)
+end
+
 
 function slow_test(f, title, limit)
     if lowercase(get(ENV, "TRANSDUCERS_JL_TEST_SKIP_SLOW", "false")) == "true"

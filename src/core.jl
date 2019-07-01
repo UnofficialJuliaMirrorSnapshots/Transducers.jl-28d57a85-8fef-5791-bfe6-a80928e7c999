@@ -27,7 +27,7 @@ julia> function step_demo(y, x)
        end;
 
 julia> result = transduce(Map(identity), Completing(step_demo), 0, 1:10)
-Reduced{Int64}(15)
+Reduced(15)
 
 julia> result isa Reduced
 true
@@ -52,6 +52,8 @@ end
 Base.:(==)(x::Reduced, y::Reduced) = x.value == y.value
 Base.:(==)(x::Reduced, ::Any) = false
 
+Base.show(io::IO, x::Reduced) = _default_show(io, x)
+
 isreduced(::Reduced) = true
 isreduced(::Any) = false
 
@@ -59,7 +61,7 @@ isreduced(::Any) = false
     reduced([x = nothing])
 
 Stop transducible process with the final value `x` (default:
-`nothing`).  Return `x` as-is if it's already is a `reduced` value.
+`nothing`).  Return `x` as-is if it already is a `reduced` value.
 
 See [`Reduced`](@ref), [`unreduced`](@ref).
 
@@ -82,7 +84,7 @@ julia> foreach(Enumerate(), "abc") do (i, x)
            if x == 'b'
                return reduced()
            end
-       end
+       end;
 1 a
 2 b
 ```
@@ -104,23 +106,44 @@ unreduced(x::Reduced) = x.value
 unreduced(x) = x
 
 """
-    @return_if_reduced val
+    @return_if_reduced expr
 
 It transforms the given expression to:
 
 ```julia
+val = expr
 val isa Reduced && return val
+val
 ```
 
+See also [`@next`](@ref).
+
+!!! compat "Transducers.jl 0.3"
+
+    In v0.2, the calling convention was `@return_if_reduced
+    complete(rf, val)` and it was transformed to `val isa Reduced &&
+    return reduced(complete(rf, unreduced(val)))`.  For the rationale
+    behind the change, see [this commit
+    message](https://github.com/tkf/Transducers.jl/commit/74f8961fea97b746cb097b27aa5a5761e9bf4dae).
+
 # Examples
-```jldoctest:
+```jldoctest; filter = [r"#[0-9]+#", r"#=.*?=#"]
 julia> using Transducers: @return_if_reduced
 
-julia> @macroexpand @return_if_reduced val
-:(val isa Transducers.Reduced && return val)
+julia> @macroexpand @return_if_reduced f(x)
+quote
+    #158#val = f(x)
+    #= ... =#
+    begin
+        #158#val isa Transducers.Reduced && return #158#val
+        #= ... =#
+        #158#val
+    end
+end
 ```
 """
 macro return_if_reduced(ex)
+    code = :(val isa Reduced && return val; val)
     if ex isa Expr && ex.head == :call && length(ex.args) == 3
         val = esc(ex)
         return quote
@@ -130,12 +153,53 @@ macro return_if_reduced(ex)
                 Please use `@return_if_reduced val`.
                 """)
             end
-            $val isa Reduced && return $val
+            val = $val
+            $code
         end
     end
     val = esc(ex)
-    :($val isa Reduced && return $val)
+    :(val = $val; $code)
 end
+
+"""
+    @next(rf, state, input)
+
+It is expanded to
+
+```julia
+result = next(rf, state, input)
+result isa Reduced && return result
+result
+```
+
+This is usually the best way to call `next` as checking for `Reduced`
+is required to support early termination.
+
+See also: [`next`](@ref), [`Reduced`](@ref), [`@return_if_reduced`](@ref).
+"""
+macro next(rf, state, input)
+    quote
+        result = next($(esc.((rf, state, input))...))
+        result isa Reduced && return result
+        result
+    end
+end
+
+struct NoType end
+const NOTYPE = NoType()
+const Typeish{T} = Union{Type{T}, NoType}
+
+astype(::NoType) = Any
+astype(T::Type) = T
+
+function Base.show(io::IO, ::NoType)
+    if !get(io, :limit, false)
+        # Don't show full name in REPL etc.:
+        print(io, "Transducers.")
+    end
+    print(io, "NOTYPE")
+end
+
 
 abstract type Transducer end
 abstract type AbstractFilter <: Transducer end
@@ -168,6 +232,7 @@ AbstractFilter
 abstract type AbstractReduction{intype, innertype} end
 
 InType(::T) where T = InType(T)
+InType(NOTYPE::NoType) = NOTYPE
 InType(::Type{<:AbstractReduction{intype}}) where {intype} = intype
 InType(T::Type) = throw(MethodError(InType, (T,)))
 
@@ -190,14 +255,16 @@ Return the transducer `xf` associated with `rf`.  Returned transducer
 """
 xform(rf::AbstractReduction) = rf.xform
 
+has(rf::AbstractReduction, T::Type{<:Transducer}) = has(Transducer(rf), T)
+
 struct BottomRF{intype, F} <: AbstractReduction{intype, F}
     inner::F
 end
 
 BottomRF{intype}(f::F) where {intype, F} = BottomRF{intype, F}(f)
 
-ensurerf(rf::AbstractReduction, ::Type) = rf
-ensurerf(f, intype::Type) = BottomRF{intype}(f)
+ensurerf(rf::AbstractReduction, ::Typeish) = rf
+ensurerf(f, intype::Typeish) = BottomRF{intype}(f)
 
 # Not calling rf.inner(result, input) etc. directly since it can be
 # `Completing` etc.
@@ -229,6 +296,8 @@ struct Reduction{X <: Transducer, I, intype} <: AbstractReduction{intype, I}
     inner::I
 end
 
+@inline (rf::Reduction)(state, input) = next(rf, state, input)
+
 prependxf(rf::AbstractReduction, xf) = Reduction(xf, rf, InType(rf))
 setinner(rf::Reduction, inner) = Reduction(xform(rf), inner, InType(rf))
 
@@ -249,19 +318,19 @@ transducer `xform(rf)::X` and the inner reducing function
 """
 const R_{X} = Reduction{<:X}
 
-Reduction(xf::X, inner::I, ::Type{InType}) where {X, I, InType} =
+Reduction(xf::X, inner::I, InType::Typeish) where {X, I} =
     if I <: AbstractReduction
         Reduction{X, I, InType}(xf, inner)
     else
-        Reduction(xf, ensurerf(inner, outtype(xf, InType)), InType)
+        Reduction(xf, ensurerf(inner, _outtype(xf, InType)), InType)
     end
 
-@inline function Reduction(xf_::Composition, f, intype::Type)
+@inline function Reduction(xf_::Composition, f, intype::Typeish)
     xf = _normalize(xf_)
     # @assert !(xf.outer isa Composition)
     return Reduction(
         xf.outer,
-        Reduction(xf.inner, f, outtype(xf.outer, intype)),
+        Reduction(xf.inner, f, _outtype(xf.outer, intype)),
         intype)
 end
 
@@ -330,6 +399,9 @@ This is the only required interface.  It takes the following form
 next(rf::R_{X}, result, input) =
     # code calling next(inner(rf), result, possibly_modified_input)
 ```
+
+When calling `next`, it is almost always a better idea to use the
+macro form [`@next`](@ref).  See the details in its documentation.
 
 See [`Map`](@ref), [`Filter`](@ref), [`Cat`](@ref), etc. for
 real-world examples.
@@ -503,12 +575,36 @@ unwrap_all(result) = result
 unwrap_all(ps::Reduced) = Reduced(unwrap_all(unreduced(ps)))
 
 """
+    needintype(xf::Transducer) :: Bool
+    needintype(T::Type{<:Transducer}) :: Bool
+
+Return `false` if `start(xf::T, _)` does not need `intype`.  Abstract
+`Transducer` defaults to return `true`.  This is because it is
+impossible to know if a user-defined transducer needs `intype`
+(typically via `initvalue`).
+"""
+needintype(::T) where {T <: Transducer} = needintype(T)
+needintype(::Type{<:Transducer}) = true
+needintype(::Type{Composition{XO, XI}}) where {XO, XI} =
+    needintype(XO) || needintype(XI)
+
+function default_needintype_with_init(T::Type{<:Transducer})
+    I = fieldtype(T, :init)
+    return I <: AbstractInitializer
+    # Maybe I need to do this?
+    # return !isconcretetype(I) || I <: AbstractInitializer
+end
+
+"""
     outtype(xf::Transducer, intype)
 
 Output item type for the transducer `xf` when the input type is `intype`.
 """
 outtype(::Any, ::Any) = Any
 outtype(::AbstractFilter, intype) = intype
+
+_outtype(::Any, ::NoType) = NOTYPE
+_outtype(xf, intype) = outtype(xf, intype)
 
 # isexpansive(::Any) = true
 isexpansive(::Transducer) = true
@@ -564,12 +660,7 @@ end
 
 start(rf::SideEffect, result) = start(rf.f, result)
 complete(::SideEffect, result) = result
-function next(rf::SideEffect, result, input)
-    y = rf.f(input)
-    y isa Reduced && return y
-    return result
-end
-# TODO: Should `SideEffect` return `y` always?
+next(rf::SideEffect, _, input) = rf.f(input)
 
 """
     right([l, ]r) -> r
@@ -607,6 +698,8 @@ identityof(::typeof(right), ::Any) = nothing
 # This is just a right identity but `right` is useful for left-fold
 # context anyway so I guess it's fine.
 
+
+abstract type AbstractInitializer end
 
 """
     Initializer(f)
@@ -681,26 +774,117 @@ julia> mapfoldl(Map(identity), push!, "abc"; init=Initializer(T -> T[]))
  'c'
 ```
 """
-struct Initializer{F}
+struct Initializer{F} <: AbstractInitializer
     f::F
 end
 
 initvalue(x, ::Any) = x
-initvalue(init::Initializer, intype) = init.f(intype)
+initvalue(init::Initializer, intype) = init.f(astype(intype))
 
 _initvalue(rf::Reduction) = initvalue(xform(rf).init, InType(rf))
 
 inittypeof(::T, ::Type) where T = T
-function inittypeof(init::Initializer, intype::Type)
+function inittypeof(init::AbstractInitializer, intype::Type)
     # Maybe I should just call it?  But that would be a bit of waste
     # when `init.f` allocates...
-    T = Base.promote_op(init.f, Type{intype})
+    T = Base.promote_op(initvalue, typeof(init), Type{intype})
     isconcretetype(T) && return T
-    return typeof(init.f(intype))  # T==Union{} hits this code pass
+    return typeof(initvalue(init, intype))  # T==Union{} hits this code pass
 end
 
-function Base.show(io::IO, init::Initializer)
-    print(io, "Initializer(")
-    show(io, init.f)
-    print(io, ')')
+Base.show(io::IO, init::Initializer) = _default_show(io, init)
+
+
+struct DefaultIdentityInitializer{T} <: AbstractInitializer
+    op::T
 end
+
+initvalue(init::DefaultIdentityInitializer, intype) = identityof(init.op, intype)
+
+
+"""
+    CopyInit(value)
+
+This is equivalent to `Initializer(_ -> deepcopy(value))`.
+
+See [`Initializer`](@ref).
+
+!!! compat "Transducers.jl 0.3"
+
+    New in version 0.3.
+
+# Examples
+```jldoctest
+julia> using Transducers
+
+julia> init = CopyInit([]);
+
+julia> foldl(push!, Map(identity), 1:3; init=init)
+3-element Array{Any,1}:
+ 1
+ 2
+ 3
+
+julia> foldl(push!, Map(identity), 1:3; init=init)  # `init` can be reused
+3-element Array{Any,1}:
+ 1
+ 2
+ 3
+```
+"""
+struct CopyInit{T} <: AbstractInitializer
+    value::T
+end
+
+initvalue(init::CopyInit, ::Any) = deepcopy(init.value)
+inittypeof(::CopyInit{T}, ::Type) where T = T
+
+Base.show(io::IO, init::CopyInit) = _default_show(io, init)
+
+@inline foldlargs(op, x) = x
+@inline foldlargs(op, x1, x2, xs...) =
+    foldlargs(op,
+              @return_if_reduced(op(x1, x2)),
+              xs...)
+
+"""
+    @default_finaltype(xf::Transducer, coll)
+
+Infer the type of the object that would be fed into the second
+argument `input` of the bottom reducing function `rf(acc, input)`.
+
+See: `Base.@default_eltype`
+"""
+macro default_finaltype(xf, coll)
+    quote
+        # `eltype(coll)` does not work when `coll` is an iterator;
+        # that's why we are using `Base.@default_eltype`:
+        intype = Base.@default_eltype($(esc(coll)))
+        Core.Compiler.return_type(
+            _getoutput,
+            Tuple{typeof($(esc(xf))), intype},
+        ) |> _real_state_type
+    end
+end
+
+# # How `@default_finaltype` works
+#
+# When `xf` has a filter-like transducer, the inference would say that
+# the output of `next(reducingfunction(xf, right), ..., x)` is
+# `Union{Nothing, THE_DESIRED_TYPE}` because `nothing` is the default
+# "identity" of `right`.  So, we set the initial value of `acc` as a
+# dummy singleton `_FakeState()` and strip it off from the inferred
+# `Union{_FakeState, THE_DESIRED_TYPE}` to get `THE_DESIRED_TYPE`.
+#
+# Note that using `_FakeState` is important for supporting cases like
+# `Union{Nothing, Int}` being the correct output type of `xf`.
+
+struct _FakeState end
+
+function _getoutput(xf, x)
+    rf = reducingfunction(xf, right)
+    return unreduced(next(rf, _start_init(rf, _FakeState()), x))
+end
+
+_real_state_type(T) = T
+_real_state_type(::Type{Union{T, _FakeState}}) where T = T
