@@ -90,7 +90,8 @@ julia> transduce(rf_good, "", 1:3)
 @inline reducingfunction(xf::Transducer, step; kwargs...) =
     _reducingfunction(xf, step, NOTYPE; kwargs...)
 
-@inline _reducingfunction(xf::Transducer, step, intype::Typeish; simd=false) =
+@inline _reducingfunction(xf::Transducer, step, intype::Typeish;
+                          simd::SIMDFlag = Val(false)) =
     maybe_usesimd(Reduction(xf, step, intype), simd)
 
 """
@@ -251,7 +252,13 @@ This API is modeled after $(_cljref("transduce")).
   1-argument form (i.e., [`complete`](@ref) protocol).
 - `reducible`: A reducible object (array, dictionary, any iterator, etc.).
 - `init`: An initial value fed to the first argument to reducing step
-  function `step`.
+  function `step`.  This argument can be omitted for well know binary
+  operations like `+` or `*`.  Supported binary operations are listed
+  in Initials.jl documentation.  When `Init` (not the result of
+  `Init`, such as `Init(*)`) is given, it is automatically "instantiated"
+  as `Init(step)` (where `step` is appropriately unwrapped if `step` is
+  a `Completing`).  See [Empty result handling](@ref) in the manual
+  for more information.
 - `simd`: If `true` or `:ivdep`, enable SIMD using `Base.@simd`.  If
   `:ivdep`, use `@simd ivdep for ... end` variant.  Read Julia manual
   of `Base.@simd` to understand when it is appropriate to use this
@@ -294,36 +301,67 @@ function transduce(xform::Transducer, f, init, coll; kwargs...)
     return transduce(rf, init, coll; kwargs...)
 end
 
-_needintype(xf, init) =
-    init isa MissingInit ||
+_needintype(xf, step, init) =
+    (init isa MissingInit && !hasinitial(_realbottomrf(step))) ||
     (init isa Initializer && !(init isa CopyInit)) ||
     needintype(xf)
 
 rf_for(xf, step, init, intype) =
-    Reduction(xf, step, _needintype(xf, init) ? intype : NOTYPE)
-
-struct MissingInit end
-
-provide_init(rf::AbstractReduction, init) = initvalue(init, FinalType(rf))
-function provide_init(rf::AbstractReduction, ::MissingInit)
-    T = FinalType(rf)
-    op = as(rf, BottomRF).inner
-    return identityof(op, T)
-end
+    Reduction(xf, step, _needintype(xf, step, init) ? intype : NOTYPE)
 
 # Materialize initial value and then call start.
 _start_init(rf, init) = start(rf, provide_init(rf, init))
 
+_unreduced__foldl__(rf, step, coll) = unreduced(__foldl__(rf, step, coll))
+
 # TODO: should it be an internal?
-@inline function transduce(rf0::AbstractReduction, init, coll; simd=false)
+@inline function transduce(rf0::AbstractReduction, init, coll;
+                           simd::SIMDFlag = Val(false))
     # Inlining `transduce` and `__foldl__` were essential for the
     # `darkritual` below to work.
     rf = maybe_usesimd(rf0, simd)
-    return __foldl__(rf, _start_init(rf, init), coll)
+    state = _start_init(rf, init)
+    result = __foldl__(rf, state, coll)
+    if unreduced(result) isa DefaultInit
+        throw(EmptyResultError(rf0))
+        # Should I check if `init` is a `MissingInit`?
+    end
+    # At this point, `return result` is the semantically correct thing
+    # to do.  What follows are some convoluted instructions to
+    # convince the compiler that this function is type-stable (in some
+    # cases).  Note that return type would be inference-dependent only
+    # if `init` is a `OptInit` type.  In the default case where `init
+    # isa DefaultInit`, the real code pass is the `throw` above.
+
+    # Unpacking as `ur_result` and re-packing it later somehow helps
+    # the compiler to correctly eliminate a possibility in a `Union`.
+    ur_result = unreduced(result)
+    if ur_result isa InferableInit
+        # Using `rf0` instead of `rf` helps the compiler.  Note that
+        # this means that we are relying on that enabling SIMD does
+        # not change the return type.
+        realtype = _nonidtype(Core.Compiler.return_type(
+            _unreduced__foldl__,
+            typeof((rf0, state, coll)),
+        ))
+        if realtype isa Type
+            realvalue = convert(realtype, ur_result)
+            if result isa Reduced
+                return Reduced(realvalue)
+            else
+                return realvalue
+            end
+        end
+    end
+    if result isa Reduced
+        return Reduced(ur_result)
+    else
+        return ur_result
+    end
 end
 
 function Base.mapfoldl(xform::Transducer, step, itr;
-                       simd = false,
+                       simd::SIMDFlag = Val(false),
                        init = MissingInit())
     unreduced(transduce(xform, step, init, itr; simd=simd))
 end
@@ -373,7 +411,7 @@ end
 # AbstractArray for disambiguation
 function Base.mapreduce(xform::Transducer, step, itr::AbstractArray;
                         init = MissingInit(),
-                        simd = false,
+                        simd::SIMDFlag = Val(false),
                         kwargs...)
     rf = _reducingfunction(xform, step, eltype(itr); simd=simd)
     return unreduced(__reduce__(rf, init, itr; kwargs...))
@@ -439,7 +477,7 @@ function Base.iterate(ts::Eduction, state = nothing)
             result = next(ts.rf, result, input)
             if isreduced(result)
                 rdone = true
-                result = complete(ts.rf, unreduced(result))
+                result = unreduced(result)
                 break
             end
         end
@@ -601,12 +639,12 @@ true
 ```
 """
 function Base.map!(xf::Transducer, dest::AbstractArray, src::AbstractArray;
-                   simd = false)
+                   simd::SIMDFlag = Val(false))
     _map!(_prepare_map(xf, dest, src, simd)...)
     return dest
 end
 
-_map!(rf, coll, dest) = transduce(darkritual(rf, dest), nothing, coll)
+_map!(rf, coll, dest) = transduce(darkritual(rf), nothing, coll)
 
 # Deep-copy `AbstractReduction` so that compiler can treat the all
 # reducing function tree nodes as local variables (???).  Aslo, it
@@ -614,18 +652,14 @@ _map!(rf, coll, dest) = transduce(darkritual(rf, dest), nothing, coll)
 # fetch `dest` via `getproperty` in each iteration.  (This is too much
 # magic...  My reasoning of how it works could be completely wrong.
 # But at least it should not change the semantics of the function.)
-@inline darkritual(rf::R, dest) where {R <: Reduction} =
-    if !(inner(rf) isa BottomRF)
-        R(xform(rf), darkritual(inner(rf), dest))
-    else
-        @assert xform(rf).array === dest
-        xf = typeof(xform(rf))(dest) :: SetIndex
-        R(xf, inner(rf))
-    end
-@inline darkritual(rf::R, dest) where {R <: Joiner} =
-    R(darkritual(inner(rf), dest), rf.value)
-@inline darkritual(rf::R, dest) where {R <: Splitter} =
-    R(darkritual(inner(rf), dest), rf.lens)
+@inline darkritual(x) = x
+@inline darkritual(xf::SetIndex) = typeof(xf)(xf.array)
+@inline darkritual(rf::R) where {R <: Reduction} =
+    R(darkritual(xform(rf)), darkritual(inner(rf)))
+@inline darkritual(rf::R) where {R <: Joiner} =
+    R(darkritual(inner(rf)), rf.value)
+@inline darkritual(rf::R) where {R <: Splitter} =
+    R(darkritual(inner(rf)), rf.lens)
 
 function _prepare_map(xf, dest, src, simd)
     isexpansive(xf) && error("map! only supports non-expanding transducer")
@@ -673,7 +707,7 @@ The first form is a shorthand for `mapfoldl(xf, Completing(step),
 reducible)`.  It is intended to be used with a `do` block.  It is also
 equivalent to `foldl(step, eduction(xf, itr))`.
 
-See: [`mapfoldl`](@ref).
+See: [`mapfoldl`](@ref), [Empty result handling](@ref).
 
 # Examples
 ```jldoctest

@@ -18,7 +18,7 @@ reduction steps, use [`Zip`](@ref).
 """
 
 _use_initializer = """
-An [`Initializer`](@ref) object can be passed to `init` for creating
+Pass [`OnInit`](@ref) or [`CopyInit`](@ref) object to `init` for creating
 a dedicated (possibly mutable) state for each fold.
 """
 
@@ -150,6 +150,7 @@ outtype(::Cat, intype) = ieltype(intype)
 # why `start` for `Cat` has to bail out immediately; i.e., it's not a
 # bug that `start(inner(rf), iresult)` is not called here:
 start(rf::R_{Cat}, result) = wrap(rf, Unseen(), result)
+complete(rf::R_{Cat}, result) = complete(inner(rf), unwrap(rf, result)[2])
 
 next(rf::R_{Cat}, result, input) =
     wrapping(rf, result) do istate0, iresult
@@ -372,6 +373,7 @@ struct Take <: AbstractFilter
 end
 
 start(rf::R_{Take}, result) = wrap(rf, xform(rf).n, start(inner(rf), result))
+complete(rf::R_{Take}, result) = complete(inner(rf), unwrap(rf, result)[2])
 
 next(rf::R_{Take}, result, input) =
     wrapping(rf, result) do n, iresult
@@ -416,18 +418,19 @@ end
 
 function start(rf::R_{TakeLast}, result)
     n = xform(rf).n
-    return wrap(rf, (-n, Vector{InType(rf)}(undef, n)), start(inner(rf), result))
+    return wrap(rf, (-n, Union{}[]), start(inner(rf), result))
 end
 
 next(rf::R_{TakeLast}, result, input) =
-    wrapping(rf, result) do (c, buffer), iresult
+    wrapping(rf, result) do (c, buffer0), iresult
         c += 1
-        n = length(buffer)
+        n = xform(rf).n
         if c <= 0
-            buffer[c + n] = input
+            buffer = push!!(buffer0, input)
             (c, buffer), iresult
         else
-            buffer[c] = input
+            @assert length(buffer0) == n
+            buffer = setindex!!(buffer0, input, c)
             (c < n ? c : 0, buffer), iresult
         end
     end
@@ -435,7 +438,7 @@ next(rf::R_{TakeLast}, result, input) =
 function complete(rf::R_{TakeLast}, result)
     (c, buffer), iresult = unwrap(rf, result)
     if c <= 0  # buffer is not full (or c is just wrapping)
-        for i in 1:(c + length(buffer))
+        for i in 1:length(buffer)
             iresult = @next(inner(rf), iresult, @inbounds buffer[i])
         end
     else
@@ -510,6 +513,7 @@ struct TakeNth <: AbstractFilter
 end
 
 start(rf::R_{TakeNth}, result) = wrap(rf, xform(rf).n, start(inner(rf), result))
+complete(rf::R_{TakeNth}, result) = complete(inner(rf), unwrap(rf, result)[2])
 
 next(rf::R_{TakeNth}, result, input) =
     wrapping(rf, result) do c, iresult
@@ -551,6 +555,7 @@ struct Drop <: AbstractFilter
 end
 
 start(rf::R_{Drop}, result) = wrap(rf, 0, start(inner(rf), result))
+complete(rf::R_{Drop}, result) = complete(inner(rf), unwrap(rf, result)[2])
 
 next(rf::R_{Drop}, result, input) =
     wrapping(rf, result) do c, iresult
@@ -581,11 +586,11 @@ julia> collect(DropLast(2), 1:5)
  2
  3
 
-julia> collect(DropLast(2), 1:1)
-0-element Array{Int64,1}
+julia> collect(DropLast(2), 1:1) == []
+true
 
-julia> collect(DropLast(2), 1:0)
-0-element Array{Int64,1}
+julia> collect(DropLast(2), 1:0) == []
+true
 ```
 """
 struct DropLast <: AbstractFilter
@@ -599,25 +604,28 @@ end
 
 function start(rf::R_{DropLast}, result)
     n = xform(rf).n + 1
-    return wrap(rf, (-n, Vector{InType(rf)}(undef, n)), start(inner(rf), result))
+    return wrap(rf, (-n, Union{}[]), start(inner(rf), result))
 end
 
+complete(rf::R_{DropLast}, result) = complete(inner(rf), unwrap(rf, result)[2])
+
 next(rf::R_{DropLast}, result, input) =
-    wrapping(rf, result) do (c, buffer), iresult
+    wrapping(rf, result) do (c, buffer0), iresult
         c += 1
-        n = length(buffer)
+        n = xform(rf).n + 1
         if c <= 0
-            buffer[c + n] = input
+            buffer = push!!(buffer0, input)
             if c == 0
+                @assert length(buffer) == n
                 (c, buffer), next(inner(rf), iresult, buffer[1])
             else
                 (c, buffer), iresult
             end
         elseif c >= n
-            buffer[c] = input
+            buffer = setindex!!(buffer0, input, c)
             (0, buffer), next(inner(rf), iresult, buffer[1])
         else
-            buffer[c] = input
+            buffer = setindex!!(buffer0, input, c)
             (c, buffer), next(inner(rf), iresult, buffer[c + 1])
         end
     end
@@ -650,6 +658,7 @@ struct DropWhile{F} <: AbstractFilter
 end
 
 start(rf::R_{DropWhile}, result) = wrap(rf, true, start(inner(rf), result))
+complete(rf::R_{DropWhile}, result) = complete(inner(rf), unwrap(rf, result)[2])
 
 next(rf::R_{DropWhile}, result, input) =
     wrapping(rf, result) do dropping, iresult
@@ -687,6 +696,7 @@ isexpansive(::FlagFirst) = false
 outtype(::FlagFirst, intype) = Tuple{Bool,intype}
 
 start(rf::R_{FlagFirst}, result) = wrap(rf, true, start(inner(rf), result))
+complete(rf::R_{FlagFirst}, result) = complete(inner(rf), unwrap(rf, result)[2])
 
 next(rf::R_{FlagFirst}, result, input) =
     wrapping(rf, result) do isfirst, iresult
@@ -750,8 +760,7 @@ isexpansive(::Partition) = false
 outtype(::Partition, intype) = DenseSubVector{intype}
 
 function start(rf::R_{Partition}, result)
-    buf = Vector{InType(rf)}()
-    sizehint!(buf, xform(rf).size)
+    buf = Union{}[]
     return wrap(rf, (0, 0, buf), start(inner(rf), result))
 end
 
@@ -761,12 +770,12 @@ function next(rf::R_{Partition}, result, input)
     end
 end
 
-function _window_next(rf, i, s, buf, iresult, input)
+function _window_next(rf, i, s, buf0, iresult, input)
     i += 1
     @assert 1 <= i <= xform(rf).size
-    len = length(buf)
+    len = length(buf0)
     if s == 0 && len < xform(rf).size
-        push!(buf, input)
+        buf = push!!(buf0, input)
         if i == xform(rf).size
             # This is the first time `length(buf) == xform(rf).size` is
             # true.
@@ -782,10 +791,10 @@ function _window_next(rf, i, s, buf, iresult, input)
         end
         return (i, s, buf), iresult
     elseif len < 2 * xform(rf).size - 1
-        push!(buf, input)
+        buf = push!!(buf0, input)
     else
         # TODO: optimize for size < step case
-        buf[i + xform(rf).size - 1] = input
+        buf = setindex!!(buf0, input, i + xform(rf).size - 1)
     end
     if i == xform(rf).size
         # Wrapping the window.  Next window will be i=1.
@@ -857,7 +866,7 @@ isexpansive(::PartitionBy) = false
 outtype(::PartitionBy, intype) = Vector{intype}
 
 function start(rf::R_{PartitionBy}, result)
-    iinput = InType(rf)[]
+    iinput = Union{}[]
     return wrap(rf, (iinput, Unseen()), start(inner(rf), result))
 end
 
@@ -865,11 +874,13 @@ end
     wrapping(rf, result) do (iinput, pval), iresult
         val = xform(rf).f(input)
         if pval isa Unseen || val == pval
-            push!(iinput, input)
+            iinput = push!!(iinput, input)
         else
             iresult = next(inner(rf), iresult, iinput)
-            empty!(iinput)
-            isreduced(iresult) || push!(iinput, input)
+            iinput = empty!!(iinput)
+            if !isreduced(iresult)
+                iinput = push!!(iinput, input)
+            end
         end
         return (iinput, val), iresult
     end
@@ -946,17 +957,19 @@ struct Unique <: AbstractFilter
 end
 
 function start(rf::R_{Unique}, result)
-    seen = Set(InType(rf)[])
+    seen = Set(Union{}[])
     return wrap(rf, seen, start(inner(rf), result))
 end
+
+complete(rf::R_{Unique}, result) = complete(inner(rf), unwrap(rf, result)[2])
 
 function next(rf::R_{Unique}, result, input)
     wrapping(rf, result) do seen, iresult
         if input in seen
             return seen, iresult
         else
-            push!(seen, input)
-            return seen, next(inner(rf), iresult, input)
+            seen′ = push!!(seen, input)
+            return seen′, next(inner(rf), iresult, input)
         end
     end
 end
@@ -990,6 +1003,7 @@ end
 outtype(xf::Interpose, intype) = Union{typeof(xf.sep), intype}
 
 start(rf::R_{Interpose}, result) = wrap(rf, Val(true), start(inner(rf), result))
+complete(rf::R_{Interpose}, result) = complete(inner(rf), unwrap(rf, result)[2])
 
 next(rf::R_{Interpose}, result, input) =
     wrapping(rf, result) do isfirst, iresult
@@ -1025,6 +1039,7 @@ struct Dedupe <: AbstractFilter
 end
 
 start(rf::R_{Dedupe}, result) = wrap(rf, Unseen(), start(inner(rf), result))
+complete(rf::R_{Dedupe}, result) = complete(inner(rf), unwrap(rf, result)[2])
 
 next(rf::R_{Dedupe}, result, input) =
     wrapping(rf, result) do prev, iresult
@@ -1036,7 +1051,7 @@ next(rf::R_{Dedupe}, result, input) =
     end
 
 """
-    Scan(f, [init])
+    Scan(f, [init = Init])
 
 Accumulate input with binary function `f` and pass the accumulated
 result so far to the inner reduction step.
@@ -1093,7 +1108,7 @@ struct Scan{F, T} <: Transducer
     init::T
 end
 
-Scan(f) = Scan(f, DefaultIdentityInitializer(f))
+Scan(f) = Scan(f, makeid(f, Init))
 
 _lefttype(xf::Scan, intype) = inittypeof(xf.init, intype)
 
@@ -1117,6 +1132,8 @@ function start(rf::R_{Scan}, result)
     init = _initvalue(rf)
     return wrap(rf, init, start(inner(rf), result))
 end
+
+complete(rf::R_{Scan}, result) = complete(inner(rf), unwrap(rf, result)[2])
 
 function next(rf::R_{Scan}, result, input)
     wrapping(rf, result) do acc, iresult
@@ -1219,7 +1236,7 @@ julia> using Transducers
 
 julia> flushlast(rf, result) = rf(@next(rf, result, result.state));
 
-julia> xf = AdHocXF(Initializer(_ -> nothing), flushlast) do rf, result, input
+julia> xf = AdHocXF(nothing, flushlast) do rf, result, input
            m = match(r"^name:(.*)", input)
            if m === nothing
                push!(result.state.lines, input)
@@ -1365,6 +1382,7 @@ isexpansive(::Iterated) = false
 outtype(xf::Iterated, intype) = inittypeof(xf.init, intype)
 start(rf::R_{Iterated}, result) =
     wrap(rf, _initvalue(rf), start(inner(rf), result))
+complete(rf::R_{Iterated}, result) = complete(inner(rf), unwrap(rf, result)[2])
 next(rf::R_{Iterated}, result, ::Any) =
     wrapping(rf, result) do istate, iresult
         return xform(rf).f(istate), next(inner(rf), iresult, istate)
@@ -1411,6 +1429,7 @@ Count(start = 1) = Count(start, oneunit(start))
 isexpansive(::Count) = false
 outtype(xf::Count{T}, ::Any) where T = T
 start(rf::R_{Count}, result) = wrap(rf, xform(rf).start, start(inner(rf), result))
+complete(rf::R_{Count}, result) = complete(inner(rf), unwrap(rf, result)[2])
 next(rf::R_{Count}, result, ::Any) =
     wrapping(rf, result) do istate, iresult
         return istate + xform(rf).step, next(inner(rf), iresult, istate)
@@ -1816,6 +1835,7 @@ isexpansive(::Inject) = false
 outtype(xf::Inject, intype) = Tuple{intype, ieltype(xf.iterator)}
 start(rf::R_{Inject}, result) =
     wrap(rf, iterate(xform(rf).iterator), start(inner(rf), result))
+complete(rf::R_{Inject}, result) = complete(inner(rf), unwrap(rf, result)[2])
 next(rf::R_{Inject}, result, input) =
     wrapping(rf, result) do istate, iresult
         istate === nothing && return istate, reduced(complete(inner(rf), iresult))
@@ -1862,8 +1882,201 @@ isexpansive(::Enumerate) = false
 outtype(xf::Enumerate{T}, intype) where {T} = Tuple{T, intype}
 start(rf::R_{Enumerate}, result) =
     wrap(rf, xform(rf).start, start(inner(rf), result))
+complete(rf::R_{Enumerate}, result) = complete(inner(rf), unwrap(rf, result)[2])
 next(rf::R_{Enumerate}, result, input) =
     wrapping(rf, result) do i, iresult
         iresult2 = next(inner(rf), iresult, (i, input))
         i + xform(rf).step, iresult2
+    end
+
+"""
+    GroupBy(key, rf, [init])
+    GroupBy(key, xf::Transducer, [step = right, [init]])
+
+Group the input stream by a function `key` and then fan-out each group
+of key-value pairs to the reducing function `rf`.  For example, if
+`GroupBy` is composed as follows
+
+    Map(upstream) |> GroupBy(key, rf, init) |> Map(downstream)
+
+then the "function signatures" would be:
+
+    upstream(_) :: V
+    key(::V) :: K
+    rf(::Y, ::Pair{K, V}) ::Y
+    downstream(::Dict{K, Y})
+
+That is to say,
+
+* Ouput of the `upstream` is fed into the function `key` that produces
+  the group key (of type `K`).
+
+* For each new group key, a new transducible process is started with
+  the initial state `init :: Y` (which is shared by all transducible
+  processes).
+
+* After one "nested" reducing function `rf` is called, the
+  intermediate result dictionary (of type `Dict{K, Y}`) accumulating
+  the previous results is then fed into the `downstream`.
+
+See also `groupreduce` in
+[SplitApplyCombine.jl](https://github.com/JuliaData/SplitApplyCombine.jl).
+
+!!! compat "Transducers.jl 0.3"
+
+    New in version 0.3.
+
+# Examples
+```jldoctest
+julia> using Transducers
+       using BangBang  # for `push!!`
+
+julia> foldl(right, GroupBy(string, Map(last), push!!), [1, 2, 1, 2, 3])
+Dict{String,Array{Int64,1}} with 3 entries:
+  "1" => [1, 1]
+  "2" => [2, 2]
+  "3" => [3]
+```
+
+Note that the reduction stops if one of the group returns a
+[`reduced`](@ref).  This can be used, for example, to find if there is
+a group with a sum grater than 3 and stop the computation as soon as
+it is find:
+
+```jldoctest; setup = :(using Transducers)
+julia> result = transduce(
+           GroupBy(
+               string,
+               Map(last) |> Scan(+) |> ReduceIf(x -> x > 3),
+           ),
+           right,
+           nothing,
+           [1, 2, 1, 2, 3],
+       );
+
+julia> result isa Reduced
+true
+
+julia> unreduced(result)
+Dict{String,Int64} with 2 entries:
+  "1" => 2
+  "2" => 4
+```
+"""
+struct GroupBy{K, R, T} <: Transducer
+    key::K
+    rf::R
+    init::T
+end
+
+function GroupBy(key, xf::Transducer, step = right, init = MissingInit())
+    rf = reducingfunction(xf, step)
+    if init isa MissingInit
+        return GroupBy(key, rf)
+    else
+        return GroupBy(key, rf, makeid(_realbottomrf(step), init))
+    end
+end
+
+function GroupBy(key, rf)
+    op = _realbottomrf(rf)
+    hasinitial(op) || throw(MissingInitError(op))
+    return GroupBy(key, rf, DefaultInit(op))
+end
+
+# "Bangbang" version of `set!(f, dict, key)` interface I proposed in
+# https://github.com/JuliaLang/julia/pull/31367#issuecomment-504561329
+# TODO: specialize for `Dict` to minimize hashing
+function dictset!!(f, d0, key)
+    if haskey(d0, key)
+        y = f(Some(d0[key]))
+    else
+        y = f(nothing)
+    end
+    if y === nothing
+        d = delete!!(d0, key)
+    else
+        d = setindex!!(d0, something(y), key)
+    end
+    return d, y
+end
+
+function start(rf::R_{GroupBy}, result)
+    gstate = Dict{Union{},Union{}}()
+    gresult = Dict{Union{},Union{}}()
+    return wrap(rf, (gstate, gresult), start(inner(rf), result))
+end
+
+complete(rf::R_{GroupBy}, result) = complete(inner(rf), unwrap(rf, result)[2])
+
+@inline function next(rf::R_{GroupBy}, result, input)
+    wrapping(rf, result) do (gstate, gresult), iresult
+        key = xform(rf).key(input)
+        gstate, somegr = dictset!!(gstate, key) do value
+            if value === nothing
+                gr0 = start(xform(rf).rf, initvalue(xform(rf).init, NOTYPE))
+            else
+                gr0 = something(value)
+            end
+            gr = next(xform(rf).rf, gr0, key => input)
+            return Some(gr)
+        end
+        gr = something(somegr)
+        bresult = unwrap_all(unreduced(gr))
+        if bresult !== DefaultInit(_realbottomrf(xform(rf).rf))
+            gresult = setindex!!(gresult, bresult, key)
+        end
+        iresult = next(inner(rf), iresult, gresult)
+        if gr isa Reduced && !(iresult isa Reduced)
+            return (gstate, gresult), reduced(complete(inner(rf), iresult))
+        else
+            return (gstate, gresult), iresult
+        end
+    end
+end
+# It may be useful to avoid computing hash twice by storing `key =>
+# (gr, unreduced(gr))` in a single dictionary.  A read-only view of
+# `key => unreduced(gr)` can be passed to the downstream transducer.
+# This view dictionary has to check `DefaultInit` in `getindex` etc. to
+# pretend that it's not there.
+
+
+"""
+    ReduceIf(pred)
+
+Stop fold when `pred(x)` returns `true` for the output `x` of the
+upstream transducer.
+
+# Examples
+```jldoctest
+julia> using Transducers
+
+julia> foldl(right, ReduceIf(x -> x == 3), 1:10)
+3
+```
+"""
+struct ReduceIf{P} <: AbstractFilter
+    pred::P
+end
+
+function next(rf::R_{ReduceIf}, result0, input)
+    shouldreduce = xform(rf).pred(input)
+    result = next(inner(rf), result0, input)
+    if shouldreduce
+        return reduced(complete(inner(rf), result))
+    end
+    return result
+end
+
+# More immediate version of `ReduceIf`.  Not sure if this is useful so
+# not exporting it ATM.
+struct AbortIf{P} <: AbstractFilter
+    pred::P
+end
+
+next(rf::R_{AbortIf}, result, input) =
+    if xform(rf).pred(input)
+        return reduced(complete(inner(rf), result))
+    else
+        return next(inner(rf), result, input)
     end

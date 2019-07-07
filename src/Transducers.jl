@@ -2,10 +2,10 @@ module Transducers
 
 export Transducer, Map, Filter, Cat, MapCat, Take, PartitionBy, Scan, Zip,
     Replace, TakeWhile, TakeNth, Drop, DropLast, DropWhile, Keep, Unique,
-    Interpose, Dedupe, Partition, Iterated, Count,
+    Interpose, Dedupe, Partition, Iterated, Count, GroupBy, ReduceIf,
     TakeLast, FlagFirst, MapSplat, ScanEmit, Enumerate, NotA, OfType,
     transduce, eduction, setinput, Reduced, reduced, unreduced, ifunreduced,
-    Completing, Initializer, CopyInit, right, reducingfunction
+    Completing, Initializer, OnInit, CopyInit, right, reducingfunction
 
 # Deprecated:
 export Distinct
@@ -13,12 +13,14 @@ export Distinct
 using Base.Broadcast: Broadcasted
 
 using ArgCheck
+using BangBang: push!!, empty!!, setindex!!
 using Requires
+using Initials: Initials, Initial, SpecificInitial, Init,
+    hasinitial
 
 import Setfield
 using Setfield: @lens, @set, set
 
-include("bangbang.jl")
 include("showutils.jl")
 include("basics.jl")
 include("core.jl")
