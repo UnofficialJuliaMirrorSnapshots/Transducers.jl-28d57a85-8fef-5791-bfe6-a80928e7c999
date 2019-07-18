@@ -5,8 +5,8 @@ using Statistics: mean
 using Transducers
 using Transducers: Transducer, simple_transduce, Reduced, isexpansive,
     TeeZip, GetIndex, SetIndex, Inject, @~, outtype, infer_input_types,
-    EmptyResultError, IdentityNotDefinedError, AbortIf
-using Initials: Init
+    EmptyResultError, IdentityNotDefinedError, AbortIf, @next
+using InitialValues: Init
 using Logging: NullLogger, with_logger
 
 inc(x) = x + oneunit(x)
@@ -75,6 +75,14 @@ end
 macro test_inferred(ex)
     ex = quote
         $Test.@test (($Test.@inferred $ex); true)
+    end
+    esc(ex)
+end
+
+
+macro test_broken_inferred(ex)
+    ex = quote
+        $Test.@test_broken (($Test.@inferred $ex); true)
     end
     esc(ex)
 end

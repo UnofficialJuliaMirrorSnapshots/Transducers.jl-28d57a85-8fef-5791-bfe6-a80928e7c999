@@ -185,6 +185,19 @@ macro next(rf, state, input)
     end
 end
 
+"""
+    @next!(rf, state, input)
+
+It is expanded to
+
+```julia
+state = @next(rf, state, input)
+```
+"""
+macro next!(rf, state, input)
+    esc(:($state = $(@__MODULE__).@next($rf, $state, $input)))
+end
+
 struct NoType end
 const NOTYPE = NoType()
 const Typeish{T} = Union{Type{T}, NoType}
@@ -719,12 +732,14 @@ julia> mapfoldl(Drop(5), right, 1:3; init=0)  # using `init` as the default valu
 right(l, r) = r
 right(r) = r
 
-Initials.@def right
+InitialValues.@def right
 
 identityof(::typeof(right), ::Any) = nothing
 # This is just a right identity but `right` is useful for left-fold
 # context anyway so I guess it's fine.
 
+abstract type Reducible end
+abstract type Foldable <: Reducible end
 
 abstract type AbstractInitializer end
 
@@ -816,7 +831,7 @@ julia> mapfoldl(xf1, right, 10:11)
 This may not be desired.  To avoid this behavior, create an `OnInit`
 object which takes a factory function to create a new initial value.
 
-```jldoctest OnInit; filter = r"#+[0-9]+"
+```jldoctest OnInit; filter = r"#+[0-9]+(\\(\\))?"
 julia> xf2 = Scan(push!, OnInit(() -> []))
 Scan(push!, OnInit(##9#10()))
 
@@ -960,14 +975,14 @@ _real_state_type(::Type{Union{T, _FakeState}}) where T = T
 """
     DefaultInit(op)
 
-`DefaultInit` is like `Initials.Init` but **strictly** internal
+`DefaultInit` is like `InitialValues.Init` but **strictly** internal
 to Transducers.jl.  It is used for checking if the bottom reducing
 function is never called.
 """
-struct DefaultInit{OP} <: SpecificInitial{OP} end
+struct DefaultInit{OP} <: SpecificInitialValue{OP} end
 DefaultInit(::OP) where OP = DefaultInit{OP}()
 
-struct OptInitOf{OP} <: SpecificInitial{OP} end
+struct OptInitOf{OP} <: SpecificInitialValue{OP} end
 OptInit(::OP) where OP = OptInitOf{OP}()
 # It seems that compiler can infer more when passing around a
 # `Function` than a `Type` (since a `Function` is a singleton?).
@@ -1013,7 +1028,7 @@ _realbottomrf(rf::Completing) = rf.f
 provide_init(rf, init) = initvalue(init, FinalType(rf))
 function provide_init(rf, ::MissingInit)
     op = _realbottomrf(rf)
-    hasinitial(op) && return DefaultInit(op)
+    hasinitialvalue(op) && return DefaultInit(op)
     throw(MissingInitError(op))
 end
 
@@ -1030,7 +1045,7 @@ function Base.showerror(io::IO, e::IdentityNotDefinedError)
     `init = $Init` is specified but the identity element `Init(op)` is not defined for
         op = $op
     Note that `op` must be a well known binary operations like `+` or `*`.
-    See Initials.jl documentation for more information.
+    See InitialValues.jl documentation for more information.
     """))
 end
 
@@ -1042,6 +1057,6 @@ end
 
 makeid(op, init) = init
 function makeid(op, idfactory::Union{typeof(Init), typeof(OptInit)})
-    hasinitial(op) && return idfactory(op)
+    hasinitialvalue(op) && return idfactory(op)
     throw(IdentityNotDefinedError(op, idfactory))
 end

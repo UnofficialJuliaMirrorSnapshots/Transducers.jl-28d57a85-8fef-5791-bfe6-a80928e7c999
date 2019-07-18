@@ -324,4 +324,20 @@ end
     @test_broken err isa EmptyResultError
 end
 
+@testset "AdHocFoldable" begin
+    counting = AdHocFoldable() do rf, acc, _
+        i = 0
+        while true
+            i += 1
+            acc = @next(rf, acc, i)
+        end
+    end
+
+    @test collect(Take(3), counting) == 1:3
+
+    @test foreach(counting) do i
+        i == 3 && return reduced()
+    end === reduced()
+end
+
 end  # module

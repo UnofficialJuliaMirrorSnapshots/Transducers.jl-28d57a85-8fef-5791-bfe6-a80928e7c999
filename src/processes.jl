@@ -153,7 +153,7 @@ end
     val = @next(rf, init, @inbounds arr[idxs[firstindex(idxs)]])
     @simd_if rf for k in firstindex(idxs) + 1:lastindex(idxs)
         i = @inbounds idxs[k]
-        val = @next(rf, val, @inbounds arr[i])
+        @next!(rf, val, @inbounds arr[i])
     end
     return complete(rf, val)
 end
@@ -170,7 +170,7 @@ end
         idxs = eachindex(zs.is...)
         val = @next(rf, init, _getvalues(firstindex(idxs), zs.is...))
         @simd_if rf for i in firstindex(idxs) + 1:lastindex(idxs)
-            val = @next(rf, val, _getvalues(i, zs.is...))
+            @next!(rf, val, _getvalues(i, zs.is...))
         end
         return complete(rf, val)
     end
@@ -201,7 +201,7 @@ end
     # TODO: Handle the case inner iterators are tuples.  In such case,
     # inner-most non-tuple iterators should use @simd_if.
     @simd_if rf for input in iterator
-        val = @next(rf, val, (input, outer...))
+        @next!(rf, val, (input, outer...))
     end
     return val
 end
@@ -254,7 +254,7 @@ This API is modeled after $(_cljref("transduce")).
 - `init`: An initial value fed to the first argument to reducing step
   function `step`.  This argument can be omitted for well know binary
   operations like `+` or `*`.  Supported binary operations are listed
-  in Initials.jl documentation.  When `Init` (not the result of
+  in InitialValues.jl documentation.  When `Init` (not the result of
   `Init`, such as `Init(*)`) is given, it is automatically "instantiated"
   as `Init(step)` (where `step` is appropriately unwrapped if `step` is
   a `Completing`).  See [Empty result handling](@ref) in the manual
@@ -302,7 +302,7 @@ function transduce(xform::Transducer, f, init, coll; kwargs...)
 end
 
 _needintype(xf, step, init) =
-    (init isa MissingInit && !hasinitial(_realbottomrf(step))) ||
+    (init isa MissingInit && !hasinitialvalue(_realbottomrf(step))) ||
     (init isa Initializer && !(init isa CopyInit)) ||
     needintype(xf)
 
@@ -884,6 +884,10 @@ Base.foreach(eff, xform::Transducer, coll; kwargs...) =
 Base.foreach(eff, ed::Eduction; kwargs...) =
     transduce(reform(ed.rf, SideEffect(eff)), nothing, ed.coll;
               kwargs...)
+Base.foreach(eff, reducible::Reducible; kwargs...) =
+    transduce(BottomRF{Any}(SideEffect(eff)), nothing, reducible;
+              kwargs...)
+# Maybe use `__reduce__` in `foreach`?
 
 """
     ifunreduced(f, [x])
@@ -984,3 +988,127 @@ Base.Channel(xform::Transducer, ed::Eduction; kwargs...) =
 
 Base.Channel(ed::Eduction; kwargs...) =
     Channel(Transducer(ed), ed.coll; kwargs...)
+
+
+"""
+    AdHocFoldable(foldl, [collection = nothing])
+
+Provide a different way to fold `collection` without creating a
+wrapper type.
+
+# Arguments
+- `foldl::Function`: a function that implements [`__foldl__`](@ref).
+- `collection`: a collection passed to the last argument of
+  `foldl`.
+
+# Examples
+```jldoctest
+julia> using Transducers
+       using Transducers: @next, complete
+       using ArgCheck
+
+julia> function uppertriangle(A::AbstractMatrix)
+           @argcheck !Base.has_offset_axes(A)
+           return AdHocFoldable(A) do rf, acc, A
+               for j in 1:size(A, 2), i in 1:min(j, size(A, 1))
+                   acc = @next(rf, acc, @inbounds A[i, j])
+               end
+               return complete(rf, acc)
+           end
+       end;
+
+julia> A = reshape(1:6, (3, 2))
+3×2 reshape(::UnitRange{Int64}, 3, 2) with eltype Int64:
+ 1  4
+ 2  5
+ 3  6
+
+julia> collect(Map(identity), uppertriangle(A))
+3-element Array{Int64,1}:
+ 1
+ 4
+ 5
+
+julia> function circularwindows(xs::AbstractVector, h::Integer)
+           @argcheck !Base.has_offset_axes(xs)
+           @argcheck h >= 0
+           @argcheck 2 * h + 1 <= length(xs)
+           return AdHocFoldable(xs) do rf, acc, xs
+               buffer = similar(xs, 2 * h + 1)
+               @inbounds for i in 1:h
+                   buffer[1:h - i + 1] .= @view xs[end - h + i:end]
+                   buffer[h - i + 2:end] .= @view xs[1:h + i]
+                   acc = @next(rf, acc, buffer)
+               end
+               for i in h + 1:length(xs) - h
+                   acc = @next(rf, acc, @inbounds @view xs[i - h:i + h])
+               end
+               @inbounds for i in 1:h
+                   buffer[1:end - i] .= @view xs[end - 2 * h + i:end]
+                   buffer[end - i + 1:end] .= @view xs[1:i]
+                   acc = @next(rf, acc, buffer)
+               end
+               return complete(rf, acc)
+           end
+       end;
+
+julia> collect(Map(collect), circularwindows(1:9, 2))
+9-element Array{Array{Int64,1},1}:
+ [8, 9, 1, 2, 3]
+ [9, 1, 2, 3, 4]
+ [1, 2, 3, 4, 5]
+ [2, 3, 4, 5, 6]
+ [3, 4, 5, 6, 7]
+ [4, 5, 6, 7, 8]
+ [5, 6, 7, 8, 9]
+ [6, 7, 8, 9, 1]
+ [7, 8, 9, 1, 2]
+
+julia> expressions(str::AbstractString; kwargs...) =
+           AdHocFoldable(str) do rf, val, str
+               pos = 1
+               while true
+                   expr, pos = Meta.parse(str, pos;
+                                          raise = false,
+                                          depwarn = false,
+                                          kwargs...)
+                   expr === nothing && break
+                   val = @next(rf, val, expr)
+               end
+               return complete(rf, val)
+           end;
+
+julia> collect(Map(identity), expressions(\"\"\"
+       x = 1
+       y = 2
+       \"\"\"))
+2-element Array{Expr,1}:
+ :(x = 1)
+ :(y = 2)
+
+julia> counting = AdHocFoldable() do rf, acc, _
+           i = 0
+           while true
+               i += 1
+               acc = @next(rf, acc, i)
+           end
+       end;
+
+julia> foreach(counting) do i
+           @show i;
+           i == 3 && return reduced()
+       end;
+i = 1
+i = 2
+i = 3
+```
+"""
+struct AdHocFoldable{F, C} <: Foldable
+    f::F
+    coll::C
+end
+
+AdHocFoldable(f) = AdHocFoldable(f, nothing)
+
+@inline __foldl__(rf, init, foldable::AdHocFoldable) =
+    foldable.f(rf, init, foldable.coll)

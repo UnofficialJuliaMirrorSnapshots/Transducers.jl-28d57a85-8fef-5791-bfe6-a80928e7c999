@@ -5,7 +5,8 @@ export Transducer, Map, Filter, Cat, MapCat, Take, PartitionBy, Scan, Zip,
     Interpose, Dedupe, Partition, Iterated, Count, GroupBy, ReduceIf,
     TakeLast, FlagFirst, MapSplat, ScanEmit, Enumerate, NotA, OfType,
     transduce, eduction, setinput, Reduced, reduced, unreduced, ifunreduced,
-    Completing, Initializer, OnInit, CopyInit, right, reducingfunction
+    Completing, Initializer, OnInit, CopyInit, right, reducingfunction,
+    AdHocFoldable
 
 # Deprecated:
 export Distinct
@@ -15,8 +16,8 @@ using Base.Broadcast: Broadcasted
 using ArgCheck
 using BangBang: push!!, empty!!, setindex!!
 using Requires
-using Initials: Initials, Initial, SpecificInitial, Init,
-    hasinitial
+using InitialValues: InitialValues, InitialValue, SpecificInitialValue, Init,
+    hasinitialvalue
 
 import Setfield
 using Setfield: @lens, @set, set
@@ -44,6 +45,8 @@ function __init__()
             _foldl_blockarray(rf, acc, coll)
     end
     @require LazyArrays="5078a376-72f3-5289-bfd5-ec5146d43c02" begin
+        __foldl__(rf, acc, coll::LazyArrays.Hcat) =
+            _foldl_lazy_hcat(rf, acc, coll)
         __foldl__(rf, acc, coll::LazyArrays.Vcat) =
             _foldl_lazy_vcat(rf, acc, coll)
     end

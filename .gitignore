@@ -1,10 +1,10 @@
-.DS_Store
-Manifest.toml
-*.jl.cov
 *.jl.*.cov
 *.jl.*mem
+*.jl.cov
+.DS_Store
+/Manifest.toml
+/benchmark/*.json
 /docs/Manifest.toml
 /docs/build/
 /docs/site/
 /docs/src/examples
-/Manifest.toml
