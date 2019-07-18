@@ -48,7 +48,8 @@ is_anonymous(n) = n == :anonymous || startswith(string(n), '#')
 
 _is_default_arg(xf, name::Symbol, value) = is_default_arg(xf, Val(name), value)
 is_default_arg(xf, name, value) = false
-is_default_arg(xf::Scan, ::Val{:init}, value) = Scan(xf.f).init === value
+is_default_arg(xf::Scan, ::Val{:init}, value) = value === Init(xf.f)
+is_default_arg(xf::GroupBy, ::Val{:init}, value) = value isa DefaultInit
 
 _name_of_transducer_type(xf) = nameof(typeof(xf))
 
@@ -228,18 +229,10 @@ end
 
 function _show_multiline_args(io, mime, rf::Splitter)
     _show_impl(io, mime, inner(rf))
-    println(io, ",")
-    _show_impl(io, mime, rf.lens)
 end
 
 function _show_multiline_args(io, mime, rf::Joiner)
     _show_impl(io, mime, inner(rf))
-    println(io, ",")
-    if isdefined(rf, :value)
-        _show_impl(io, mime, rf.value)
-    else
-        _show_impl(io, mime, Text("#undef"))
-    end
 end
 
 @specialize

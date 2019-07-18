@@ -185,6 +185,19 @@ macro next(rf, state, input)
     end
 end
 
+"""
+    @next!(rf, state, input)
+
+It is expanded to
+
+```julia
+state = @next(rf, state, input)
+```
+"""
+macro next!(rf, state, input)
+    esc(:($state = $(@__MODULE__).@next($rf, $state, $input)))
+end
+
 struct NoType end
 const NOTYPE = NoType()
 const Typeish{T} = Union{Type{T}, NoType}
@@ -418,15 +431,26 @@ some internal state, this is the last chance to "flush" the result.
 
 See [`PartitionBy`](@ref), etc. for real-world examples.
 
-If **both** `complete(rf::R_{X}, state)` **and** `start(rf::R_{X},
-state)` are defined, `complete` **must** unwarp `state` before
-returning `state` to the outer reducing function.  If `complete` is
-not defined for `R_{X}`, this happens automatically.
+If `start(rf::R_{X}, state)` is defined, `complete` **must** unwarp
+`state` before returning `state` to the outer reducing function.
+
+!!! compat "Transducers.jl 0.3"
+
+    In Transducers.jl 0.2, `complete` had a fallback implementation
+    to automatically call `unwrap` when `wrap` is called in `start`.
+    Relying on this fallback implementation is now deprecated.
 """
 complete(f, result) = f(result)
-complete(rf::Reduction, result) =
+complete(rf::AbstractReduction, result) =
     # Not using dispatch to avoid ambiguity
     if ownsstate(rf, result)
+        Base.depwarn(
+            string(
+                "`complete` for ", typeof(xform(rf)), " is not defined.",
+                " Automatic implementation of `complete` method will be",
+                " disabled in the future."
+            ),
+            :complete)
         complete(inner(rf), unwrap(rf, result)[2])
     else
         complete(inner(rf), result)
@@ -448,14 +472,31 @@ combine(rf::Reduction, a, b) =
         combine(inner(rf), a, b)
     end
 
+privatestate(::T, state, result) where {T <: AbstractReduction} =
+    privatestate(T, state, result)
+
 struct PrivateState{T, S, R}
     state::S
     result::R
+
+    # Rename constructor to make sure that it is always constructed
+    # through the factory function:
+    global privatestate(::Type{T}, state::S, result::R) where {
+        T <: AbstractReduction,
+        S,
+        R,
+    } =
+        new{T, S, R}(state, result)
 end
 # TODO: make it a tuple-like so that I can return it as-is
 
-PrivateState(rf::Reduction, state, result) =
-    PrivateState{typeof(rf), typeof(state), typeof(result)}(state, result)
+Setfield.constructor_of(::Type{<:PrivateState{T}}) where T =
+    (state, result) -> privatestate(T, state, result)
+
+@inline psstate(ps) = ps.state
+@inline psresult(ps) = ps.result
+@inline setpsstate(ps, x) = @set ps.state = x
+@inline setpsresult(ps, x) = @set ps.result = x
 
 ownsstate(::Any, ::Any) = false
 ownsstate(::R, ::PrivateState{T}) where {R, T} = R === T
@@ -477,7 +518,7 @@ unwrap(rf, wrap(rf, state, iresult)) == (state, iresult)
 This is intended to be used only in [`complete`](@ref).  Inside
 [`next`](@ref), use [`wrapping`](@ref).
 """
-unwrap(::T, ps::PrivateState{T}) where {T} = (ps.state, ps.result)
+unwrap(::T, ps::PrivateState{T}) where {T} = (psstate(ps), psresult(ps))
 
 unwrap(::T1, ::PrivateState{T2}) where {T1, T2} =
     error("""
@@ -539,13 +580,8 @@ only sees the outer-most "tree" `result₀` during the reduction.
 
 See [`wrapping`](@ref), [`unwrap`](@ref), and [`start`](@ref).
 """
-wrap(rf::T, state, iresult) where {T} = PrivateState(rf, state, iresult)
-wrap(rf, state, iresult::Reduced) = unwrap_all(iresult) :: Reduced
-#
-# Note: `unwrap_all` is required since any transducer in arbitrary
-# location of the `Reduction` chain can create a `Reduced`.
-#
-# But `unwrap_all`ing in `wrap` sounds counter intuitive.  Maybe rename?
+wrap(rf::T, state, iresult) where {T} = privatestate(rf, state, iresult)
+wrap(rf, state, iresult::Reduced) = iresult
 
 """
     wrapping(f, rf, result)
@@ -570,7 +606,7 @@ See [`wrap`](@ref), [`unwrap`](@ref), and [`next`](@ref).
     return wrap(rf, state1, iresult1)
 end
 
-unwrap_all(ps::PrivateState) = unwrap_all(ps.result)
+unwrap_all(ps::PrivateState) = unwrap_all(psresult(ps))
 unwrap_all(result) = result
 unwrap_all(ps::Reduced) = Reduced(unwrap_all(unreduced(ps)))
 
@@ -584,9 +620,12 @@ impossible to know if a user-defined transducer needs `intype`
 (typically via `initvalue`).
 """
 needintype(::T) where {T <: Transducer} = needintype(T)
-needintype(::Type{<:Transducer}) = true
 needintype(::Type{Composition{XO, XI}}) where {XO, XI} =
     needintype(XO) || needintype(XI)
+
+# This definition is not used in the builtin transducers.  It will be
+# used only for the transducers defined outside Transducers.jl:
+needintype(::Type{<:Transducer}) = true
 
 function default_needintype_with_init(T::Type{<:Transducer})
     I = fieldtype(T, :init)
@@ -642,8 +681,6 @@ next(rf::Completing, result, input)  = next(rf.f, result, input)
 complete(::Completing, result) = result
 combine(rf::Completing, a, b) = combine(rf.f, a, b)
 
-identityof(rf::Completing, T) = identityof(rf.f, T)
-
 # If I expose `Reduction` as a user-interface, I should export
 # `skipcomplete` instead of the struct `Completing`.
 skipcomplete(rf::Reduction) = Reduction(NoComplete(), rf, InType(rf))
@@ -674,8 +711,12 @@ right(r) = r
 
 This function is meant to be used as `step` argument for
 [`mapfoldl`](@ref) etc. for extracting the last output of the
-transducers.  Note that `init` for `right` is set to `nothing` if not
-provided.
+transducers.
+
+!!! compat "Transducers.jl 0.3"
+
+    Initial value must be manually specified.  In 0.2, it was
+    automatically set to `nothing`.
 
 # Examples
 ```jldoctest
@@ -684,9 +725,6 @@ julia> using Transducers
 julia> mapfoldl(Take(5), right, 1:10)
 5
 
-julia> mapfoldl(Drop(5), right, 1:3) === nothing
-true
-
 julia> mapfoldl(Drop(5), right, 1:3; init=0)  # using `init` as the default value
 0
 ```
@@ -694,10 +732,14 @@ julia> mapfoldl(Drop(5), right, 1:3; init=0)  # using `init` as the default valu
 right(l, r) = r
 right(r) = r
 
+InitialValues.@def right
+
 identityof(::typeof(right), ::Any) = nothing
 # This is just a right identity but `right` is useful for left-fold
 # context anyway so I guess it's fine.
 
+abstract type Reducible end
+abstract type Foldable <: Reducible end
 
 abstract type AbstractInitializer end
 
@@ -709,11 +751,54 @@ processes (e.g., [`mapfoldl`](@ref)) and "stateful" transducers (e.g.,
 [`Scan`](@ref)).  Factory function `f` takes the input type to the
 transducer or the reducing function.
 
-`Initializer` must be used whenever using in-place reduction with
-[`mapreduce`](@ref).
+!!! compat "Transducers.jl 0.3"
+
+    `Initializer` is deprecated since Transducers 0.3.  Please use
+    [`OnInit`](@ref).
+"""
+struct Initializer{F} <: AbstractInitializer
+    f::F
+
+    Initializer{F}(f) where F = new{F}(f)
+end
+
+function Initializer(f)
+    Base.depwarn(
+        """
+        `Initializer(T -> ...)` is deprecated.  Please use `OnInit(() -> ...)`.
+        """,
+        :Initializer)
+    return Initializer{typeof(f)}(f)
+end
+
+initvalue(x, ::Any) = x
+initvalue(init::Initializer, intype) = init.f(astype(intype))
+
+_initvalue(rf::Reduction) = initvalue(xform(rf).init, InType(rf))
+
+inittypeof(::T, ::Type) where T = T
+function inittypeof(init::AbstractInitializer, intype::Type)
+    # Maybe I should just call it?  But that would be a bit of waste
+    # when `init.f` allocates...
+    T = Base.promote_op(initvalue, typeof(init), Type{intype})
+    isconcretetype(T) && return T
+    return typeof(initvalue(init, intype))  # T==Union{} hits this code pass
+end
+
+Base.show(io::IO, init::Initializer) = _default_show(io, init)
+
+"""
+    OnInit(f)
+
+Call a callable `f` to create an initial value.
+
+See also [`CopyInit`](@ref).
+
+`OnInit` or `CopyInit` must be used whenever using in-place reduction
+with [`mapreduce`](@ref).
 
 # Examples
-```jldoctest Initializer
+```jldoctest OnInit
 julia> using Transducers
 
 julia> xf1 = Scan(push!, [])
@@ -733,7 +818,7 @@ Notice that the array is stored in `xf1` and mutated in-place.  As a
 result, second run of `mapfoldl` contains the results from the first
 run:
 
-```jldoctest Initializer
+```jldoctest OnInit
 julia> mapfoldl(xf1, right, 10:11)
 5-element Array{Any,1}:
   1
@@ -743,69 +828,66 @@ julia> mapfoldl(xf1, right, 10:11)
  11
 ```
 
-This may not be desired.  To avoid this behavior, create an
-`Initializer` object which takes a factory function to create a new
-initial value.
+This may not be desired.  To avoid this behavior, create an `OnInit`
+object which takes a factory function to create a new initial value.
 
-```jldoctest Initializer; filter = r"#+[0-9]+"
-julia> xf2 = Scan(push!, Initializer(T -> T[]))
-Scan(push!, Initializer(##9#10()))
+```jldoctest OnInit; filter = r"#+[0-9]+(\\(\\))?"
+julia> xf2 = Scan(push!, OnInit(() -> []))
+Scan(push!, OnInit(##9#10()))
 
 julia> mapfoldl(xf2, right, 1:3)
-3-element Array{Int64,1}:
+3-element Array{Any,1}:
  1
  2
  3
 
 julia> mapfoldl(xf2, right, [10.0, 11.0])
-2-element Array{Float64,1}:
+2-element Array{Any,1}:
  10.0
  11.0
 ```
 
 Keyword argument `init` for transducible processes also accept an
-`Initializer`:
+`OnInit`:
 
-```jldoctest Initializer
-julia> mapfoldl(Map(identity), push!, "abc"; init=Initializer(T -> T[]))
+```jldoctest OnInit
+julia> foldl(push!, Map(identity), "abc"; init=OnInit(() -> []))
+3-element Array{Any,1}:
+ 'a'
+ 'b'
+ 'c'
+```
+
+To create a copy of a mutable object, [`CopyInit`](@ref) is easier to
+use.
+
+However, more powerful and generic pattern is to use `push!!` from
+BangBang.jl and initialize `init` with `Union{}[]` so that it
+automatically finds the minimal element type.
+
+```jldoctest OnInit
+julia> using BangBang
+
+julia> foldl(push!!, Map(identity), "abc"; init=Union{}[])
 3-element Array{Char,1}:
  'a'
  'b'
  'c'
 ```
 """
-struct Initializer{F} <: AbstractInitializer
+struct OnInit{F} <: AbstractInitializer
     f::F
 end
 
-initvalue(x, ::Any) = x
-initvalue(init::Initializer, intype) = init.f(astype(intype))
+initvalue(init::OnInit, ::Any) = init.f()
+inittypeof(::OnInit, ::Type) = Any
 
-_initvalue(rf::Reduction) = initvalue(xform(rf).init, InType(rf))
-
-inittypeof(::T, ::Type) where T = T
-function inittypeof(init::AbstractInitializer, intype::Type)
-    # Maybe I should just call it?  But that would be a bit of waste
-    # when `init.f` allocates...
-    T = Base.promote_op(initvalue, typeof(init), Type{intype})
-    isconcretetype(T) && return T
-    return typeof(initvalue(init, intype))  # T==Union{} hits this code pass
-end
-
-Base.show(io::IO, init::Initializer) = _default_show(io, init)
-
-
-struct DefaultIdentityInitializer{T} <: AbstractInitializer
-    op::T
-end
-
-initvalue(init::DefaultIdentityInitializer, intype) = identityof(init.op, intype)
-
+Base.show(io::IO, init::OnInit) = _default_show(io, init)
 
 """
     CopyInit(value)
 
-This is equivalent to `Initializer(_ -> deepcopy(value))`.
+This is equivalent to `OnInit(() -> deepcopy(value))`.
 
 See [`Initializer`](@ref).
 
@@ -883,8 +965,98 @@ struct _FakeState end
 
 function _getoutput(xf, x)
     rf = reducingfunction(xf, right)
-    return unreduced(next(rf, _start_init(rf, _FakeState()), x))
+    return unreduced(complete(rf, next(rf, _start_init(rf, _FakeState()), x)))
 end
 
 _real_state_type(T) = T
 _real_state_type(::Type{Union{T, _FakeState}}) where T = T
+
+
+"""
+    DefaultInit(op)
+
+`DefaultInit` is like `InitialValues.Init` but **strictly** internal
+to Transducers.jl.  It is used for checking if the bottom reducing
+function is never called.
+"""
+struct DefaultInit{OP} <: SpecificInitialValue{OP} end
+DefaultInit(::OP) where OP = DefaultInit{OP}()
+
+struct OptInitOf{OP} <: SpecificInitialValue{OP} end
+OptInit(::OP) where OP = OptInitOf{OP}()
+# It seems that compiler can infer more when passing around a
+# `Function` than a `Type` (since a `Function` is a singleton?).
+# That's why `OptInit` is defined as a factory function.
+
+InferableInit{OP} = Union{DefaultInit{OP}, OptInitOf{OP}}
+
+_nonidtype(::Any) = nothing
+_nonidtype(::Type{Union{S, T}}) where {T, S <: InferableInit} = T
+
+struct MissingInit end
+
+struct MissingInitError <: Exception
+    op
+end
+
+function Base.showerror(io::IO, e::MissingInitError)
+    println(io, "No default identity element for ", e.op)
+    # TODO: improve error message
+end
+
+struct EmptyResultError <: Exception
+    rf
+end
+
+function Base.showerror(io::IO, e::EmptyResultError)
+    println(
+        io,
+        "EmptyResultError: ",
+        "Reducing function `", _realbottomrf(e.rf), "` is never called. ")
+    print(
+        io,
+        "The input collection is empty or the items are all filtered out ",
+        "by some transducer(s). ",
+        "It is recommended to specify `init` to avoid this kind of errors.")
+    # TODO: improve error message
+end
+
+_realbottomrf(op) = op
+_realbottomrf(rf::AbstractReduction) = _realbottomrf(as(rf, BottomRF).inner)
+_realbottomrf(rf::Completing) = rf.f
+
+provide_init(rf, init) = initvalue(init, FinalType(rf))
+function provide_init(rf, ::MissingInit)
+    op = _realbottomrf(rf)
+    hasinitialvalue(op) && return DefaultInit(op)
+    throw(MissingInitError(op))
+end
+
+struct IdentityNotDefinedError <: Exception
+    op
+    idfactory
+end
+
+function Base.showerror(io::IO, e::IdentityNotDefinedError)
+    Init = e.idfactory
+    op = e.op
+    print(io, "IdentityNotDefinedError: ")
+    print(io, strip("""
+    `init = $Init` is specified but the identity element `Init(op)` is not defined for
+        op = $op
+    Note that `op` must be a well known binary operations like `+` or `*`.
+    See InitialValues.jl documentation for more information.
+    """))
+end
+
+# Handle `init=Init` and `init=OptInit`
+function provide_init(rf, idfactory::Union{typeof(Init), typeof(OptInit)})
+    op = _realbottomrf(rf)
+    return makeid(op, idfactory)
+end
+
+makeid(op, init) = init
+function makeid(op, idfactory::Union{typeof(Init), typeof(OptInit)})
+    hasinitialvalue(op) && return idfactory(op)
+    throw(IdentityNotDefinedError(op, idfactory))
+end

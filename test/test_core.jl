@@ -1,11 +1,20 @@
 module TestCore
 include("preamble.jl")
-using Transducers: has, reform
+using Transducers: has, reform, needintype
 
 @testset "has" begin
     @test has(Count(), Count)
     @test has(Map(identity) |> Count(), Count)
     @test has(Count() |> Map(identity), Count)
+end
+
+@testset "needintype" begin
+    @test !needintype(Map)
+    @test !needintype(TeeZip)
+    @test !needintype(Scan(+, 0))
+    with_logger(NullLogger()) do
+        @test needintype(Scan(+, Initializer(T -> zero(T))))
+    end
 end
 
 @testset "reform" begin
@@ -22,6 +31,7 @@ end
 end
 
 @testset "Initializer" begin
+with_logger(NullLogger()) do
     @testset "mapfoldl" begin
         @testset for xs in iterator_variants(1:3)
             init(T::Type{<:Tuple}) = T[]
@@ -58,6 +68,20 @@ end
                 collect(Iterated(inc, Initializer(T -> 5one(T))) |> Map(first),
                         xs) ==
                     (1:10) .+ (5 - 1))
+        end
+    end
+end
+end
+
+@testset "OnInit" begin
+    @testset "mapfoldl" begin
+        @testset for xs in iterator_variants(1:3)
+            @test mapfoldl(
+                Zip(Map(identity), Map(string)),
+                push!,
+                xs,
+                init = OnInit(() -> [])
+            ) == [(1, "1"), (2, "2"), (3, "3")]
         end
     end
 end

@@ -53,8 +53,10 @@ ifunreduced
 Transducer(::Transducers.Comprehension)
 reducingfunction
 Completing
-Initializer
+OnInit
 CopyInit
+Initializer
 right
 setinput
+AdHocFoldable
 ```

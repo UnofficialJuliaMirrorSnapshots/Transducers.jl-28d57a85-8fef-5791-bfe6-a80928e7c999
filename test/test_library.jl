@@ -1,6 +1,7 @@
 module TestLibrary
 include("preamble.jl")
 using Dates
+using BangBang: push!!
 
 @testset "Cat" begin
     # Inner transducer is stateful:
@@ -53,13 +54,15 @@ end
     end
 
     @testset "outtype" begin
-        @test outtype(Scan(+), Int) === Int
+        @test outtype(Scan(+), Int) == Union{Int, typeof(Init(+))}
         @test outtype(Scan(+, 0.0), Int) === Float64
         @test outtype(Scan(+, missing), Int) === Missing
+with_logger(NullLogger()) do
         @test outtype(Scan(+, Initializer(_ -> rand())), Int) ===
             Float64
         @test outtype(Scan(+, Initializer(_ -> rand(Int))), Int) ===
             Int
+end
     end
 end
 
@@ -81,16 +84,18 @@ end
             Union{Float64, Int64}
         @test outtype(
             ScanEmit(tuple, missing), Int) === Union{Missing, Int64}
+with_logger(NullLogger()) do
         @test outtype(
             ScanEmit(tuple, Initializer(_ -> rand())), Int) ===
                 Union{Float64, Int64}
         @test outtype(
             ScanEmit(tuple, Initializer(_ -> rand(Int))), Int) === Int
+end
     end
 
     @testset "Do not call `complete` when reduced" begin
         xs = 1:8
-        xf = ScanEmit(Initializer(_ -> []), identity) do u, x
+        xf = ScanEmit(CopyInit([]), identity) do u, x
             push!(u, x)
             if x % 3 == 0
                 return u, []
@@ -128,8 +133,14 @@ end
             collect(zip(1:2:5, 2:2:6))
     end
 
-    ed = eduction(TeeZip(Filter(isodd) |> Map(x -> x + 1.0)), 1:5)
-    @test eltype(ed) === Tuple{Int,Float64}
+    ed = eduction(TeeZip(Filter(isodd) |> Map(x -> x + 1.0)) |>
+                  Map(last) |>
+                  Scan(+,
+                       with_logger(NullLogger()) do
+                           Initializer(T -> zero(T))
+                       end),
+                  1:5)
+    @test eltype(ed) === Float64
 
     xf = Map(inc) |> TeeZip(Filter(isodd)) |> Map(first)
     @testset for xs in iterator_variants(1:6)
@@ -529,6 +540,32 @@ end
             @test collect(OfType(Tuple{Vararg{Number}}), xs) == desired
         end
     end
+end
+
+@testset "GroupBy" begin
+    @test foldl(right, GroupBy(string, Map(last), push!!), [1, 2, 1, 2, 3]) ==
+        Dict("1" => [1, 1], "2" => [2, 2], "3" => [3])
+
+    @test foldl(
+        right,
+        GroupBy(
+            identity,
+            Map(last) |> Scan(+),
+            (_, x) -> x > 3 ? reduced(x) : x,
+            nothing,
+        ),
+        [1, 2, 1, 2, 3],
+    ) == Dict(2 => 4, 1 => 2)
+end
+
+@testset "ReduceIf" begin
+    @test foldl(right, ReduceIf(x -> x == 3), 1:10) === 3
+    @test foldl(right, ReduceIf(x -> x == 3), 1:2) === 2
+end
+
+@testset "AbortIf" begin
+    @test foldl(right, AbortIf(x -> x == 3), 1:10) === 2
+    @test foldl(right, AbortIf(x -> x == 3), 1:1) === 1
 end
 
 @testset "Invalid arguments" begin
