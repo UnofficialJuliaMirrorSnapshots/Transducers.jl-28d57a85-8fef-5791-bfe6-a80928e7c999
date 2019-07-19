@@ -146,6 +146,9 @@ end
     return complete(rf, val)
 end
 
+__foldl__(rf, init, coll::Tuple) =
+    complete(rf, @return_if_reduced foldlargs(rf, init, coll...))
+
 # TODO: use IndexStyle
 @inline function __foldl__(rf, init, arr::Union{AbstractArray, Broadcasted})
     isempty(arr) && return complete(rf, init)
@@ -363,6 +366,7 @@ end
 function Base.mapfoldl(xform::Transducer, step, itr;
                        simd::SIMDFlag = Val(false),
                        init = MissingInit())
+    check_no_ivdep(simd)
     unreduced(transduce(xform, step, init, itr; simd=simd))
 end
 
@@ -724,10 +728,12 @@ julia> foldl(Filter(isodd), 1:4, init=0.0) do state, input
 """
 function Base.foldl(step, xform::Transducer, itr;
                     kw...)
+    check_no_ivdep(; kw...)
     mapfoldl(xform, Completing(step), itr; kw...)
 end
 
-@inline Base.foldl(step, ed::Eduction; init=MissingInit(), kwargs...) =
+@inline function Base.foldl(step, ed::Eduction; init=MissingInit(), kwargs...)
+    check_no_ivdep(; kwargs...)
     if FinalType(ed.rf) === NOTYPE
         xf = Transducer(ed.rf)
         unreduced(transduce(xf, Completing(step), init, ed.coll; kwargs...))
@@ -735,6 +741,7 @@ end
         rf = reform(ed.rf, Completing(step))
         unreduced(transduce(rf, init, ed.coll; kwargs...))
     end
+end
 
 """
     foreach(eff, xf::Transducer, reducible; simd)

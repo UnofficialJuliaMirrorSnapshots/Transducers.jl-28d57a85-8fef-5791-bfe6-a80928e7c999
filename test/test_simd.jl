@@ -1,7 +1,7 @@
 module TestSIMD
 include("preamble.jl")
 
-using Transducers: UseSIMD, usesimd, Reduction, skipcomplete, R_
+using Transducers: UseSIMD, usesimd, Reduction, skipcomplete, R_, @simd_if
 
 asrf(xf) = Reduction(xf, right, Int)
 
@@ -49,6 +49,33 @@ end
         end
         @test ys == xs .+ 1.0
     end
+end
+
+@testset "UX" begin
+    for err in [
+        (@test_error mapfoldl(Map(identity), +, 1:2; simd=:ivdep)),
+        (@test_error foldl(+, Map(identity), 1:2; simd=:ivdep)),
+        (@test_error foldl(+, eduction(Map(identity), 1:2); simd=:ivdep)),
+        (@test_error foreach(identity, Count() |> Map(first), 1:2; simd=:ivdep)),
+    ]
+        @test occursin("`simd=:ivdep` must not be used",
+                       sprint(showerror, err))
+    end
+    @test foreach(identity, TeeZip(Map(inc)), 1:2; simd=:ivdep) isa Any
+end
+
+@testset "@simd_if" begin
+    err = @test_error @macroexpand @simd_if rf for i in 1:1
+    end
+    @test occursin("No call of the form `@next!(rf, acc, input)` is found.",
+                   sprint(showerror, err))
+
+    err = @test_error @macroexpand @simd_if rf for i in 1:1
+        @next!(rf, acc, init)
+        @next!(rf, acc, init)
+    end
+    @test occursin("Multiple `@next!(rf, acc, input)` statements found.",
+                   sprint(showerror, err))
 end
 
 end  # module
