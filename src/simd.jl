@@ -8,6 +8,19 @@ struct UseSIMD{ivdep} <: Transducer end
 outtype(::UseSIMD, intype) = intype
 next(rf::R_{UseSIMD}, result, input) = next(inner(rf), result, input)
 
+function start(rf::R_{UseSIMD{true}}, result)
+    state = start(inner(rf), result)
+    if !(state === result || is_ivdep_compat_state(state))
+        error("`simd=:ivdep` must not be used with stateful transducers")
+    end
+    return state
+end
+
+@inline is_ivdep_compat_state(::Any) = true
+@inline is_ivdep_compat_state(::PrivateState) = false
+@inline is_ivdep_compat_state(state::Union{SplitterState, JoinerState}) =
+    is_ivdep_compat_state(psresult(state))
+
 # Make sure UseSIMD is the outer-most transducer when UseSIMD is used
 # via Cat.
 skipcomplete(rf::R_{UseSIMD}) =
@@ -32,8 +45,8 @@ findaccumulators(ex::Expr) =
         return mapfoldl(findaccumulators, append!, ex.args; init=[])
     end
 
-simdcompat(ivdep, acc, x) = x
-function simdcompat(ivdep, acc, ex::Expr)
+ivdepcompat(acc, x) = x
+function ivdepcompat(acc, ex::Expr)
     # TODO: detect Transducers.@next etc.
     if (
         (ex.head === :macrocall && ex.args[1] === Symbol("@next")) ||
@@ -43,21 +56,15 @@ function simdcompat(ivdep, acc, ex::Expr)
     elseif ex.head === :macrocall && ex.args[1] === Symbol("@next!")
         @argcheck length(ex.args) === 5
         rf, acc′, input = ex.args[3:end]
-        if ivdep
-            # No loop-carried memory dependencies are allowed.
-            # However, to support `TeeZip`, `acc` must still be
-            # supplied:
-            return quote
-                $next($rf, $acc, $input)
-                nothing
-            end
-        else
-            @assert acc′ == acc
-            # Exclude `acc isa Reduced && return acc` part:
-            return :($acc = $next($rf, $acc, $input))
+        # No loop-carried memory dependencies are allowed.
+        # However, to support `TeeZip`, `acc` must still be
+        # supplied:
+        return quote
+            $next($rf, $acc, $input)
+            nothing
         end
     else
-        return Expr(ex.head, simdcompat.(ivdep, Ref(acc), ex.args)...)
+        return Expr(ex.head, ivdepcompat.(Ref(acc), ex.args)...)
     end
 end
 
@@ -74,7 +81,15 @@ by `next` is ignored when `ivdep` is specified.
 """
 macro simd_if(rf, loop)
     accs = findaccumulators(loop)
-    @argcheck length(accs) == 1
+    if length(accs) == 0
+        error(
+            "No call of the form `@next!(rf, acc, input)` is found.\n",
+            "`@next(rf, acc, input)` and `next(rf, acc, input)` are not",
+            " supported inside `@simd_if`."
+        )
+    elseif length(accs) > 1
+        error("Multiple `@next!(rf, acc, input)` statements found.")
+    end
     acc, = accs
     @gensym acc0
     # Aggressively using `$` since `esc(loop)` did not work with
@@ -83,9 +98,9 @@ macro simd_if(rf, loop)
         if $rf isa $R_{$UseSIMD}
             if $isivdep($rf)
                 $acc0 = $acc  # must not change during the loop
-                $Base.@simd ivdep $(simdcompat(true, acc0, loop))
+                $Base.@simd ivdep $(ivdepcompat(acc0, loop))
             else
-                $Base.@simd $(simdcompat(false, acc, loop))
+                $Base.@simd $loop
             end
         else
             $loop
@@ -95,6 +110,20 @@ macro simd_if(rf, loop)
 end
 
 const SIMDFlag = Union{Bool, Symbol, Val{true}, Val{false}, Val{:ivdep}}
+
+"""
+    check_no_ivdep(::SIMDFlag)
+    check_no_ivdep(; simd=Val(false), kwargs...)
+"""
+@inline check_no_ivdep(simd) = simd
+@inline check_no_ivdep(simd::Symbol) =
+    simd == :ivdep ? check_no_ivdep(Val(:ivdep)) : simd
+@noinline check_no_ivdep(::Val{:ivdep}) =
+    throw(ArgumentError(string(
+        "`simd=:ivdep` must not be used for generic `foldl` or `reduce`.",
+        " Please use `foreach`."
+    )))
+check_no_ivdep(; simd=Val(false), _...) = check_no_ivdep(simd)
 
 """
     maybe_usesimd(xform, simd)
