@@ -156,7 +156,7 @@ __foldl__(rf, init, coll::Tuple) =
     val = @next(rf, init, @inbounds arr[idxs[firstindex(idxs)]])
     @simd_if rf for k in firstindex(idxs) + 1:lastindex(idxs)
         i = @inbounds idxs[k]
-        @next!(rf, val, @inbounds arr[i])
+        val = @next(rf, val, @inbounds arr[i])
     end
     return complete(rf, val)
 end
@@ -173,7 +173,7 @@ end
         idxs = eachindex(zs.is...)
         val = @next(rf, init, _getvalues(firstindex(idxs), zs.is...))
         @simd_if rf for i in firstindex(idxs) + 1:lastindex(idxs)
-            @next!(rf, val, _getvalues(i, zs.is...))
+            val = @next(rf, val, _getvalues(i, zs.is...))
         end
         return complete(rf, val)
     end
@@ -204,7 +204,7 @@ end
     # TODO: Handle the case inner iterators are tuples.  In such case,
     # inner-most non-tuple iterators should use @simd_if.
     @simd_if rf for input in iterator
-        @next!(rf, val, (input, outer...))
+        val = @next(rf, val, (input, outer...))
     end
     return val
 end
@@ -366,7 +366,6 @@ end
 function Base.mapfoldl(xform::Transducer, step, itr;
                        simd::SIMDFlag = Val(false),
                        init = MissingInit())
-    check_no_ivdep(simd)
     unreduced(transduce(xform, step, init, itr; simd=simd))
 end
 
@@ -728,12 +727,10 @@ julia> foldl(Filter(isodd), 1:4, init=0.0) do state, input
 """
 function Base.foldl(step, xform::Transducer, itr;
                     kw...)
-    check_no_ivdep(; kw...)
     mapfoldl(xform, Completing(step), itr; kw...)
 end
 
-@inline function Base.foldl(step, ed::Eduction; init=MissingInit(), kwargs...)
-    check_no_ivdep(; kwargs...)
+@inline Base.foldl(step, ed::Eduction; init=MissingInit(), kwargs...) =
     if FinalType(ed.rf) === NOTYPE
         xf = Transducer(ed.rf)
         unreduced(transduce(xf, Completing(step), init, ed.coll; kwargs...))
@@ -741,7 +738,6 @@ end
         rf = reform(ed.rf, Completing(step))
         unreduced(transduce(rf, init, ed.coll; kwargs...))
     end
-end
 
 """
     foreach(eff, xf::Transducer, reducible; simd)
