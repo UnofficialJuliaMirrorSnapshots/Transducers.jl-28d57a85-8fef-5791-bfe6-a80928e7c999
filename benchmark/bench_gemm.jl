@@ -5,7 +5,7 @@ using BenchmarkTools
 using LinearAlgebra
 using Referenceables: referenceable
 using Transducers
-using Transducers: @simd_if, @next!, complete, maybe_usesimd, BottomRF, SideEffect
+using Transducers: @simd_if, @next, complete, maybe_usesimd, BottomRF, SideEffect
 
 _size(x) = size.(axes(x), 1)
 _size(x, i) = size(axes(x)[i], 1)
@@ -21,7 +21,7 @@ _size(x, i) = size(axes(x)[i], 1)
             @simd_if rf for i in 1:size(A, 1)
                 c = @inbounds C[i, j]
                 a = @inbounds A[i, k]
-                @next!(rf, acc, (c, a, b))
+                acc = @next(rf, acc, (c, a, b))
             end
         end
         return complete(rf, acc)
@@ -43,6 +43,7 @@ function xfmul!(C, A, B, simd=Val(false))
 
     rf = SideEffect() do (c, a, b)
         c[] = muladd(a, b, c[])
+        return  # for type stability
     end
     transduce(maybe_usesimd(BottomRF{Any}(rf), simd), nothing, CAB)
 
@@ -131,6 +132,7 @@ function fusedxfmul!(C, A, B1, B2)
         c1 = muladd(a, b1, c0)
         c2 = a^2 * b2
         c[] = c1 + c2
+        return  # for type stability
     end
 
     return C
