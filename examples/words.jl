@@ -164,43 +164,44 @@ countxf = wordsxf |> Map(processcount)
 # function `mergecont!`:
 
 mergecont!(a, b) = merge!(+, a, b)
-mergecont!(a) = a
 nothing  # hide
 
-# Note that the unary form is required for the completion.
-# Alternatively, we can use [`Completing((a, b) -> merge!(+, a,
-# b))`](@ref Completing) instead of `mergecont!`.  Putting the
-# transducer and reducing function together, we get:
+# Putting the transducer and reducing function together, we get:
 
 countwords(s; kwargs...) =
-    mapreduce(Map(Char) |> countxf,
-              mergecont!,
-              transcode(UInt8, s);
-              init = CopyInit(Dict{String,Int}()),
-              kwargs...)
+    reduce(mergecont!,
+           countxf,
+           collect(s);
+           init = CopyInit(Dict{String,Int}()),
+           kwargs...)
 nothing  # hide
 
-# Side note: Since [`mapreduce`](@ref) does not support string, the
-# input string is converted to a `Vector{UInt8}` first by `transcode`.
-# That's why there is `Map(Char) |>` before `countxf`.  Of course,
-# this is not valid for UTF-8 in general.
+# Side note: Since [`reduce`](@ref) does not support string, the input
+# string is converted to a `Vector{Char}` first by `collect`.
 #
 # Side note 2: We use [`CopyInit`](@ref) to create a fresh initial
 # state for each sub-reduce to avoid overwriting mutable data between
 # threads.
+#
+# Side note 3: [`reduce`](@ref) wraps `mergecont!` automatically with
+# [`Completing`](@ref).  This is why `mergecont!` does not have to
+# have the unary method.
 
-# Let's run some tests with different number of threads:
+# Let's run some tests with different `basesize` (`length(s) /
+# basesize` corresponds to number of tasks to be used):
 
-@testset for nthreads in [1, 2, 4]
-    @test countwords("This is a sample", nthreads=nthreads) ==
+@testset for basesize in [1, 2, 4]
+    @test countwords("This is a sample", basesize=basesize) ==
         Dict("This" => 1, "is" => 1, "a" => 1, "sample" => 1)
-    @test countwords(" Here is another sample ", nthreads=nthreads) ==
+    @test countwords(" Here is another sample ", basesize=basesize) ==
         Dict("Here" => 1, "is" => 1, "another" => 1, "sample" => 1)
-    @test countwords("JustOneWord", nthreads=nthreads) ==
+    @test countwords("JustOneWord", basesize=basesize) ==
         Dict("JustOneWord" => 1)
-    @test countwords(" ", nthreads=nthreads) == Dict()
-    @test countwords("", nthreads=nthreads) == Dict()
-    @test countwords("aaa bb aaa aaa bb bb aaa", nthreads=nthreads) ==
+    @test countwords(" ", basesize=basesize) == Dict()
+    @test countwords("", basesize=basesize) == Dict()
+    @test countwords("aaa bb aaa aaa bb bb aaa", basesize=basesize) ==
         Dict("aaa" => 4, "bb" => 3)
+    @test countwords("あああ いい あああ あああ いい いい あああ", basesize=basesize) ==
+        Dict("あああ" => 4, "いい" => 3)
 end
 nothing  # hide
