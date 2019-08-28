@@ -122,19 +122,19 @@ const FOLDL_RECURSION_LIMIT = Val(10)
 _dec(::Nothing) = nothing
 _dec(::Val{n}) where n = Val(n - 1)
 
-@inline _iterate(iter, ::Unseen) = iterate(iter)
-@inline _iterate(iter, state) = iterate(iter, state)
+function __foldl__(rf, init, coll)
+    ret = iterate(coll)
+    ret === nothing && return complete(rf, init)
+    x, state = ret
+    val = @next(rf, init, x)
+    return _foldl_iter(rf, val, coll, state, FOLDL_RECURSION_LIMIT)
+end
 
-@inline __foldl__(rf, init, coll) =
-    _foldl_iter(rf, init, coll, Unseen(), FOLDL_RECURSION_LIMIT)
-
-@inline function _foldl_iter(rf, val::T, iter, state::S, counter) where {T, S}
-    while true
-        ret = _iterate(iter, state)
-        ret === nothing && break
+@inline function _foldl_iter(rf, val::T, iter, state, counter) where T
+    while (ret = iterate(iter, state)) !== nothing
         x, state = ret
         y = @next(rf, val, x)
-        counter === Val(0) || y isa T || state isa S ||
+        counter === Val(0) || y isa T ||
             return _foldl_iter(rf, y, iter, state, _dec(counter))
         val = y
     end
@@ -145,15 +145,13 @@ __foldl__(rf, init, coll::Tuple) =
     complete(rf, @return_if_reduced foldlargs(rf, init, coll...))
 
 # TODO: use IndexStyle
-@inline __foldl__(rf, init, arr::Union{AbstractArray, Broadcasted}) =
-    _foldl_array(rf, init, arr, firstindex(arr), FOLDL_RECURSION_LIMIT)
-
-@inline function _foldl_array(rf, val::T, arr, n, counter) where T
-    @simd_if rf for i in n:lastindex(arr)
-        y = @next(rf, val, @inbounds arr[i])
-        counter === Val(0) || y isa T ||
-            return _foldl_array(rf, y, arr, i + 1, _dec(counter))
-        val = y
+@inline function __foldl__(rf, init, arr::Union{AbstractArray, Broadcasted})
+    isempty(arr) && return complete(rf, init)
+    idxs = eachindex(arr)
+    val = @next(rf, init, @inbounds arr[idxs[firstindex(idxs)]])
+    @simd_if rf for k in firstindex(idxs) + 1:lastindex(idxs)
+        i = @inbounds idxs[k]
+        val = @next(rf, val, @inbounds arr[i])
     end
     return complete(rf, val)
 end
@@ -357,135 +355,6 @@ function Base.mapfoldl(xform::Transducer, step, itr;
                        init = MissingInit())
     unreduced(transduce(xform, step, init, itr; simd=simd))
 end
-
-"""
-    mapreduce(xf, step, reducible; init, simd) :: T
-
-Possibly parallel version of [`mapfoldl`](@ref).  The "bottom"
-reduction function `step(::T, ::T) :: T` must be associative and
-`init` must be its identity element.
-
-Transducers composing `xf` must be stateless and non-terminating
-(e.g., [`Map`](@ref), [`Filter`](@ref), [`Cat`](@ref), etc.) except
-for [`ScanEmit`](@ref).  Note that [`Scan`](@ref) is not supported
-(although possible in theory).
-
-See [`mapfoldl`](@ref).
-"""
-Base.mapreduce
-
-"""
-    reduce(step, xf, reducible; init, simd)
-
-Like [`mapreduce`](@ref) but `step` is automatically wrapped by
-[`Completing`](@ref).
-"""
-Base.reduce
-
-struct SizedReducible{T} <: Reducible
-    reducible::T
-    basesize::Int
-end
-
-foldable(reducible::SizedReducible) = reducible.reducible
-
-issmall(reducible::SizedReducible) =
-    length(reducible.reducible) <= max(reducible.basesize, 1)
-
-function halve(reducible::SizedReducible)
-    left, right = halve(reducible.reducible)
-    return (
-        SizedReducible(left, reducible.basesize),
-        SizedReducible(right, reducible.basesize),
-    )
-end
-
-function halve(arr::AbstractArray)
-    # TODO: support "slow" arrays
-    mid = length(arr) ÷ 2
-    left = @view arr[firstindex(arr):firstindex(arr) - 1 + mid]
-    right = @view arr[firstindex(arr) + mid:end]
-    return (left, right)
-end
-
-function transduce_assoc(
-    xform::Transducer, step, init, coll;
-    simd::SIMDFlag = Val(false),
-    basesize = Threads.nthreads() == 1 ? typemax(Int) : 512,
-)
-    reducible = SizedReducible(coll, basesize)
-    rf = maybe_usesimd(Reduction(xform, step), simd)
-    stop = Threads.Atomic{Bool}(false)
-    acc = @return_if_reduced __reduce__(stop, rf, init, reducible)
-    return complete(rf, acc)
-end
-
-@static if VERSION >= v"1.3-alpha"
-function __reduce__(stop, rf, init, reducible::Reducible)
-    stop[] && return init
-    if issmall(reducible)
-        acc = foldl_nocomplete(rf, _start_init(rf, init), foldable(reducible))
-        if acc isa Reduced
-            stop[] = true
-        end
-        return acc
-    else
-        left, right = halve(reducible)
-        task = Threads.@spawn __reduce__(stop, rf, init, right)
-        a0 = __reduce__(stop, rf, init, left)
-        b0 = fetch(task)
-        a = @return_if_reduced a0
-        b = @return_if_reduced b0
-        stop[] && return a  # slight optimization
-        return combine(rf, a, b)
-    end
-end
-else
-function __reduce__(_stop, rf, init, reducible::SizedReducible{<:AbstractArray})
-    arr = reducible.reducible
-    basesize = reducible.basesize
-    nthreads = max(
-        1,
-        basesize <= 1 ? length(arr) : length(arr) ÷ basesize
-    )
-    if nthreads == 1
-        return foldl_nocomplete(rf, _start_init(rf, init), arr)
-    else
-        w = length(arr) ÷ nthreads
-        results = Vector{Any}(undef, nthreads)
-        Threads.@threads for i in 1:nthreads
-            if i == nthreads
-                chunk = @view arr[(i - 1) * w + 1:end]
-            else
-                chunk = @view arr[(i - 1) * w + 1:i * w]
-            end
-            results[i] = foldl_nocomplete(rf, _start_init(rf, init), chunk)
-        end
-        i = findfirst(isreduced, results)
-        i === nothing || return results[i]
-        # It can be done in `log2(n)` for loops but it's not clear if
-        # `combine` is compute-intensive enough so that launching
-        # threads is worth enough.  Let's merge the `results`
-        # sequentially for now.
-        c = foldl(results) do a, b
-            combine(rf, a, b)
-        end
-        return c
-    end
-end
-end  # if
-
-# AbstractArray for disambiguation
-Base.mapreduce(xform::Transducer, step, itr::AbstractArray;
-               init = MissingInit(), kwargs...) =
-    unreduced(transduce_assoc(xform, step, init, itr; kwargs...))
-
-Base.mapreduce(xform::Transducer, step, itr;
-               init = MissingInit(), kwargs...) =
-    unreduced(transduce_assoc(xform, step, init, itr; kwargs...))
-
-Base.reduce(step, xform::Transducer, itr; kwargs...) =
-    mapreduce(xform, Completing(step), itr; kwargs...)
 
 struct Eduction{F, C}
     rf::F
@@ -931,9 +800,7 @@ Base.foreach(eff, ed::Eduction; kwargs...) =
     transduce(reform(ed.rf, SideEffect(eff)), nothing, ed.coll;
               kwargs...)
 Base.foreach(eff, reducible::Reducible; kwargs...) =
-    transduce(BottomRF{Any}(SideEffect(eff)), nothing, reducible;
-              kwargs...)
-# Maybe use `__reduce__` in `foreach`?
+    transduce(BottomRF(SideEffect(eff)), nothing, reducible; kwargs...)
 
 """
     ifunreduced(f, [x])
