@@ -47,6 +47,8 @@ struct Map{F} <: Transducer
     f::F
 end
 
+Map(::Type{T}) where T = Map{Type{T}}(T)  # specialization workaround
+
 isexpansive(::Map) = false
 next(rf::R_{Map}, result, input) = next(inner(rf), result, xform(rf).f(input))
 
@@ -70,6 +72,8 @@ julia> collect(MapSplat(*), zip(1:3, 10:10:30))
 struct MapSplat{F} <: Transducer
     f::F
 end
+
+MapSplat(::Type{T}) where T = MapSplat{Type{T}}(T)  # specialization workaround
 
 isexpansive(::MapSplat) = false
 next(rf::R_{MapSplat}, result, input) =
@@ -1034,7 +1038,7 @@ This is a generalized version of the
 _cumulative sum_, _inclusive scan_, or _scan_.
 
 Note that the associativity of `f` is not required when the transducer
-is used in a process that gurantee an order, such as [`mapfoldl`](@ref).
+is used in a process that gurantee an order, such as [`foldl`](@ref).
 
 Unless `f` is a function with known identity element such as `+`, `*`,
 `min`, `max`, and `append!`, the initial state `init` must be
@@ -1624,7 +1628,7 @@ julia> using Transducers
 
 julia> ys = zeros(3);
 
-julia> mapfoldl(SetIndex(ys), first ∘ tuple, [(1, 11.1), (3, 33.3)], init=nothing)
+julia> foldl(first ∘ tuple, SetIndex(ys), [(1, 11.1), (3, 33.3)], init=nothing)
 
 julia> ys
 3-element Array{Float64,1}:
