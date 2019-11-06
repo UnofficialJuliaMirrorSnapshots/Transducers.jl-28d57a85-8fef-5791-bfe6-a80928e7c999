@@ -19,7 +19,9 @@ dtransduce
 eduction
 map!
 copy!
+copy
 append!
+Transducers.append!!
 collect
 Channel
 ```

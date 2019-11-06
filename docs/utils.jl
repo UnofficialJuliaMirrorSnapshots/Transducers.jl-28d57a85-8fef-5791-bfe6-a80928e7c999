@@ -1,3 +1,4 @@
+import BangBang
 import OnlineStats
 using Documenter
 using Transducers
@@ -64,6 +65,6 @@ function transducers_makedocs(;
         sitename = "Transducers.jl",
         authors = "Takafumi Arakaki",
         root = @__DIR__,
-        strict = VERSION < v"1.2-",
+        strict = true,
         kwargs...)
 end

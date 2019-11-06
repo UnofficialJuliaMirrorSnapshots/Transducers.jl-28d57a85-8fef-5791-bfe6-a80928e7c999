@@ -388,7 +388,7 @@ function Base.mapfoldl(xform::Transducer, step, itr;
     unreduced(transduce(xform, step, init, itr; simd=simd))
 end
 
-struct Eduction{F, C}
+struct Eduction{F, C} <: Foldable
     rf::F
     coll::C
 end
@@ -479,6 +479,15 @@ eduction(xform, coll) = Eduction(xform, coll)
 # `skipmissing` so maybe this is better for more uniform API.
 
 """
+    induction(foldable) -> (xf, foldable′)
+
+Reverse of `eduction` (I have no idea what the right name of this
+function is).
+"""
+induction(ed::Eduction) = (Transducer(ed.rf), ed.coll)
+induction(coll) = (Map(identity), coll)  # TODO: use `IdentityTransducer`
+
+"""
     setinput(ed::Eduction, coll)
 
 Set input collection of eduction `ed` to `coll`.
@@ -509,7 +518,7 @@ _setinput(::Type{T}, ::Type{T}, ed, coll) where T = @set ed.coll = coll
 _setinput(::Type, ::Type, ed, coll) = eduction(Transducer(ed), coll)
 
 """
-    append!(xf::Transducer, dest, src)
+    append!(xf::Transducer, dest, src) -> dest
 
 This API is modeled after $(_cljref("into")).
 
@@ -527,7 +536,28 @@ julia> append!(Drop(2), [-1, -2], 1:5)
 ```
 """
 Base.append!(xf::Transducer, to, from) =
-    transduce(xf, Completing(push!), to, from)
+    unreduced(transduce(xf, Completing(push!), to, from))
+
+"""
+    BangBang.append!!(xf::Transducer, dest, src) -> dest′
+
+Mutate-or-widen version of [`append!`](@ref).
+
+# Examples
+```jldoctest
+julia> using Transducers, BangBang
+
+julia> append!!(Drop(2) |> Map(x -> x + 0.0), [-1, -2], 1:5)
+5-element Array{Float64,1}:
+ -1.0
+ -2.0
+  3.0
+  4.0
+  5.0
+```
+"""
+BangBang.append!!(xf::Transducer, to, from) =
+    unreduced(transduce(xf, Completing(push!!), to, from))
 
 """
     collect(xf::Transducer, itr)
@@ -559,6 +589,26 @@ function Base.collect(xf::Transducer, coll)
     return result
 end
 # Base.collect(xf, coll) = append!([], xf, coll)
+
+"""
+    copy(xf::Transducer, T, foldable) :: Union{T, Nothing}
+    copy(xf::Transducer, foldable::T) :: Union{T, Nothing}
+
+Process `foldable` with a transducer `xf` and then create a container of type `T`
+filled with the result.  Return `nothing` if the transducer does not produce
+anything.  (This is because there is no consistent interface to create an empty
+container given its type and not all containers support creating an empty
+container.)
+"""
+function Base.copy(xf::Transducer, ::Type{T}, foldable) where T
+    result = append!!(Empty(T), foldable)
+    if result isa Empty
+        return nothing
+    end
+    return result
+end
+
+Base.copy(xf::Transducer, foldable::T) where T = copy(xf, T, foldable)
 
 """
     map!(xf::Transducer, dest, src; simd)
@@ -655,9 +705,9 @@ function Base.foldl(step, xform::Transducer, itr;
     mapfoldl(xform, Completing(step), itr; kw...)
 end
 
-@inline function Base.foldl(step, ed::Eduction; init=MissingInit(), kwargs...)
-    xf = Transducer(ed.rf)
-    return unreduced(transduce(xf, Completing(step), init, ed.coll; kwargs...))
+@inline function Base.foldl(step, foldable::Foldable; init=MissingInit(), kwargs...)
+    xf, coll = induction(foldable)
+    return unreduced(transduce(xf, Completing(step), init, coll; kwargs...))
 end
 
 """
@@ -805,11 +855,10 @@ false
 """
 Base.foreach(eff, xform::Transducer, coll; kwargs...) =
     transduce(xform, SideEffect(eff), nothing, coll; kwargs...)
-Base.foreach(eff, ed::Eduction; kwargs...) =
-    transduce(reform(ed.rf, SideEffect(eff)), nothing, ed.coll;
-              kwargs...)
-Base.foreach(eff, reducible::Reducible; kwargs...) =
-    transduce(BottomRF(SideEffect(eff)), nothing, reducible; kwargs...)
+function Base.foreach(eff, reducible::Reducible; kwargs...)
+    xf, coll = induction(reducible)
+    return transduce(xf, SideEffect(eff), nothing, coll; kwargs...)
+end
 
 """
     ifunreduced(f, [x])

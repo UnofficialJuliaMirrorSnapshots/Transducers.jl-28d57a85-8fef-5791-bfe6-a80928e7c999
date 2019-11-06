@@ -1,7 +1,7 @@
 name = "Transducers"
 uuid = "28d57a85-8fef-5791-bfe6-a80928e7c999"
 authors = ["Takafumi Arakaki <aka.tkf@gmail.com>"]
-version = "0.4.3-DEV"
+version = "0.4.4-DEV"
 
 [deps]
 ArgCheck = "dce04be8-c92d-5529-be00-80e4d2c0e197"
@@ -14,9 +14,11 @@ Requires = "ae029012-a4dd-5104-9daa-d747884805df"
 Setfield = "efcf1570-3423-57d1-acb7-fd33fddbac46"
 
 [compat]
-BangBang = "≥ 0.2"
-InitialValues = "≥ 0.2"
-Setfield = "≥ 0.3"
+ArgCheck = "1"
+BangBang = "0.3.2"
+InitialValues = "0.2"
+Requires = "0.5"
+Setfield = "0.3, 0.4, 0.5"
 julia = "1"
 
 [extras]
