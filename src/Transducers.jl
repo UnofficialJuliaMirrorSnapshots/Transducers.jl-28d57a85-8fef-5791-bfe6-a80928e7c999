@@ -5,8 +5,8 @@ export Transducer, Map, Filter, Cat, MapCat, Take, PartitionBy, Scan, Zip,
     Interpose, Dedupe, Partition, Iterated, Count, GroupBy, ReduceIf,
     TakeLast, FlagFirst, MapSplat, ScanEmit, Enumerate, NotA, OfType,
     transduce, eduction, setinput, Reduced, reduced, unreduced, ifunreduced,
-    Completing, OnInit, CopyInit, right, reducingfunction,
-    AdHocFoldable
+    Completing, OnInit, CopyInit, right, reducingfunction, dreduce, dtransduce,
+    withprogress, AdHocFoldable
 
 # Deprecated:
 export Distinct
@@ -14,13 +14,25 @@ export Distinct
 using Base.Broadcast: Broadcasted
 
 using ArgCheck
-using BangBang: push!!, empty!!, setindex!!
+using BangBang: BangBang, Empty, append!!, empty!!, push!!, setindex!!
+using Distributed: Distributed, @everywhere
+using Logging: LogLevel, @logmsg
 using Requires
 using InitialValues: InitialValues, InitialValue, SpecificInitialValue, Init,
     hasinitialvalue
 
 import Setfield
 using Setfield: @lens, @set, set
+
+# Dummy `ConstructionBase` module for supporting older `Setfield`:
+module ConstructionBase
+    using Setfield
+    @static if isdefined(Setfield, :constructorof)
+        const constructorof = Setfield.constructorof
+    else
+        const constructorof = Setfield.constructor_of
+    end
+end
 
 @static if VERSION >= v"1.3-alpha"
     using Base.Threads: @spawn
@@ -36,10 +48,12 @@ include("library.jl")
 include("simd.jl")
 include("processes.jl")
 include("reduce.jl")
+include("dreduce.jl")
 include("air.jl")
 include("lister.jl")
 include("show.jl")
 include("comprehensions.jl")
+include("progress.jl")
 include("deprecated.jl")
 
 include("interop/blockarrays.jl")

@@ -14,10 +14,14 @@ foldl
 foreach
 mapreduce
 reduce
+dreduce
+dtransduce
 eduction
 map!
 copy!
+copy
 append!
+Transducers.append!!
 collect
 Channel
 ```
@@ -60,4 +64,5 @@ CopyInit
 right
 setinput
 AdHocFoldable
+withprogress
 ```
