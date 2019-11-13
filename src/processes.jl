@@ -543,6 +543,10 @@ Base.append!(xf::Transducer, to, from) =
 
 Mutate-or-widen version of [`append!`](@ref).
 
+!!! compat "Transducers.jl 0.4.4"
+
+    New in version 0.4.4.
+
 # Examples
 ```jldoctest
 julia> using Transducers, BangBang
@@ -591,24 +595,42 @@ end
 # Base.collect(xf, coll) = append!([], xf, coll)
 
 """
-    copy(xf::Transducer, T, foldable) :: Union{T, Nothing}
-    copy(xf::Transducer, foldable::T) :: Union{T, Nothing}
+    copy(xf::Transducer, T, foldable) :: Union{T, Empty{T}}
+    copy(xf::Transducer, foldable::T) :: Union{T, Empty{T}}
 
 Process `foldable` with a transducer `xf` and then create a container of type `T`
-filled with the result.  Return `nothing` if the transducer does not produce
-anything.  (This is because there is no consistent interface to create an empty
-container given its type and not all containers support creating an empty
-container.)
-"""
-function Base.copy(xf::Transducer, ::Type{T}, foldable) where T
-    result = append!!(Empty(T), foldable)
-    if result isa Empty
-        return nothing
-    end
-    return result
-end
+filled with the result.  Return
+[`BangBang.Empty{T}`](https://tkf.github.io/BangBang.jl/dev/#BangBang.NoBang.Empty)
+if the transducer does not produce anything.  (This is because there is no
+consistent interface to create an empty container given its type and not all
+containers support creating an empty container.)
 
-Base.copy(xf::Transducer, foldable::T) where T = copy(xf, T, foldable)
+!!! compat "Transducers.jl 0.4.4"
+
+    New in version 0.4.4.
+
+# Examples
+```jldoctest
+julia> using Transducers
+       using BangBang: Empty
+
+julia> copy(Map(x -> x => x^2), Dict, 2:2)
+Dict{Int64,Int64} with 1 entry:
+  2 => 4
+
+julia> @assert copy(Filter(_ -> false), Set, 1:1) === Empty(Set)
+
+julia> using TypedTables
+
+julia> @assert copy(Map(x -> (a=x, b=x^2)), Table, 1:1) == Table(a=[1], b=[1])
+
+julia> using StructArrays
+
+julia> @assert copy(Map(x -> (a=x, b=x^2)), StructVector, 1:1) == StructVector(a=[1], b=[1])
+```
+"""
+Base.copy(xf::Transducer, ::Type{T}, foldable) where {T} = append!!(xf, Empty(T), foldable)
+Base.copy(xf::Transducer, foldable::T) where {T} = copy(xf, T, foldable)
 
 """
     map!(xf::Transducer, dest, src; simd)
